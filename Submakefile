@@ -1,0 +1,18 @@
+
+ifdef HAVE_LIBMODBUS3
+
+CMDRSK_SRCS = hal/user_comps/cmdrsk_vfd/cmdrsk_vfd.c
+CMDRSK_CFLAGS = -DDEBUG $(LIBMODBUS_CFLAGS)
+CMDRSK_LIBS = $(LIBMODBUS_LIBS)
+
+$(call TOOBJSDEPS, $(CMDRSK_SRCS)) : EXTRAFLAGS += $(CMDRSK_CFLAGS)
+
+USERSRCS += $(CMDRSK_SRCS)
+../bin/cmdrsk_vfd: $(call TOOBJS, $(CMDRSK_SRCS)) ../lib/liblinuxcnchal.so.0 ../lib/liblinuxcncini.so.0
+	$(ECHO) Linking $(notdir $@)
+	$(Q)$(CC) $(LDFLAGS) -o $@ $^ $(CMDRSK_LIBS) 
+
+TARGETS += ../bin/cmdrsk_vfd
+
+endif # HAVE_LIBMODBUS3
+
