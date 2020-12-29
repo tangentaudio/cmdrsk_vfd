@@ -4,7 +4,8 @@ LinuxCNC user component to control an Emerson/Control Techniques Commander SK VF
 Written by Steve Richardson (steve@tangentaudio.com) - December 2013
 For LinuxCNC 2.6.0~pre
 
-Locate component source in `linuxcnc-dir/src/hal/user_comps/cmdrsk_vfd`
+`gcc -I/usr/include -I/usr/include/linuxcnc -URTAPI -U__MODULE__ -DULAPI -Os  -o cmdrsk_vfd cmdrsk_vfd.c -Wl,-rpath,/lib -L/lib -llinuxcnchal -lmodbus -I/usr/include/modbus -llinuxcncini`
+
 
 ## Credits
 

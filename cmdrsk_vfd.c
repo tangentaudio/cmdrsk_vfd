@@ -70,7 +70,7 @@
 #include "rtapi.h"
 #include "hal.h"
 #include <modbus.h>
-#include "inifile.h"
+#include <inifile.h>
 #include "cmdrsk_vfd.h"
 
 /* There's an assumption in the gs2_vfd code, namely that the interesting registers
