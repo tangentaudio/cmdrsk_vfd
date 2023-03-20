@@ -4,6 +4,18 @@ LinuxCNC user component to control an Emerson/Control Techniques Commander SK VF
 Written by Steve Richardson (steve@tangentaudio.com) - December 2013
 For LinuxCNC 2.6.0~pre
 
+## Pre-Req
+
+The modbus libraries need to be installed.  On Debian-based LinuxCNC:
+
+```
+sudo apt install libmodbus-dev
+```
+
+## Build
+
+Yes, this needs a makefile.  For now, you can build it on the command line:
+
 `gcc -I/usr/include -I/usr/include/linuxcnc -URTAPI -U__MODULE__ -DULAPI -Os  -o cmdrsk_vfd cmdrsk_vfd.c -Wl,-rpath,/lib -L/lib -llinuxcnchal -lmodbus -I/usr/include/modbus -llinuxcncini`
 
 
