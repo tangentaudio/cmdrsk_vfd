@@ -499,7 +499,8 @@ static int read_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
     *(haldata->status) = status_word;
 
     GETPARAM(PR_MOTOR_FREQUENCY, &freq);
-    *(haldata->freq_out) = freq / 10.0;
+    /* Commander SK returns Pr 5.01 as signed int16 (negative = reverse) */
+    *(haldata->freq_out) = abs((int16_t)freq) / 10.0;
 
     /* Decode status word bits */
     *(haldata->drive_ok)           = (status_word & ST_DRIVE_OK)         ? 1 : 0;
@@ -532,7 +533,8 @@ static int read_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
         *(haldata->load_current_pct) = val / 10.0;
 
         GETPARAM(PR_MOTOR_SPEED, &val);
-        *(haldata->RPM) = val * 1.0;
+        /* Commander SK returns Pr 5.04 as signed int16 (negative = reverse) */
+        *(haldata->RPM) = abs((int16_t)val) * 1.0;
 
         GETPARAM(PR_HARDWARE_ENABLE, &val);
         *(haldata->hardware_enable) = val ? 1 : 0;
