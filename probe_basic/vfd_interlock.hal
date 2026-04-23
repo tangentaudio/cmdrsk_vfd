@@ -1,0 +1,41 @@
+# =====================================================================
+# VFD Interlock Logic & Monitor Widget Wiring
+# Appended to probe_basic_postgui.hal
+# =====================================================================
+
+# --- HAL logic components for VFD interlock ---
+loadrt not names=not.drawbar
+loadrt and2 names=and2.drawbar-idle
+loadrt or2 names=or2.spindle-inhibit
+addf not.drawbar servo-thread
+addf and2.drawbar-idle servo-thread
+addf or2.spindle-inhibit servo-thread
+
+# Drawbar active = NOT hardware-enable (active-low during tool change)
+net vfd-hw-enable spindle-vfd.hardware-enable => not.drawbar.in
+net drawbar-active <= not.drawbar.out
+
+# Spindle inhibit when drawbar active AND program is idle.
+# NOTE: signal "prog-running" is actually halui.program.is-idle
+# (confusing name from Probe Basic template, but verified).
+# So prog-running = TRUE when idle, FALSE when running.
+net prog-running => and2.drawbar-idle.in1
+net drawbar-active => and2.drawbar-idle.in0
+net drawbar-idle-inhibit <= and2.drawbar-idle.out
+
+# Spindle inhibit = fault OR (drawbar-active AND idle)
+net vfd-fault spindle-vfd.fault => or2.spindle-inhibit.in0
+net drawbar-idle-inhibit => or2.spindle-inhibit.in1
+net spindle-inhibit or2.spindle-inhibit.out => spindle.0.inhibit
+
+# Abort running program on VFD fault
+net vfd-fault => halui.program.stop
+
+# --- VFD status signals for monitor widget ---
+net vfd-trip-code spindle-vfd.trip-code => vfd-monitor.trip-code
+net vfd-drive-ok spindle-vfd.drive-ok => vfd-monitor.drive-ok
+net vfd-fault => vfd-monitor.fault
+net drawbar-active => vfd-monitor.drawbar-active
+
+# Fault reset: monitor widget -> VFD driver
+net vfd-fault-reset vfd-monitor.fault-reset => spindle-vfd.fault-reset
