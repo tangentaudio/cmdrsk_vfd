@@ -1,0 +1,10 @@
+# Build output
+cmdrsk_vfd
+
+# Editor artifacts
+*.swp
+*~
+.*.sw?
+
+# OS artifacts
+.DS_Store

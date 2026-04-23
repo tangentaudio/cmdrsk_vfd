@@ -1,30 +1,76 @@
 #
-# example usage of the VF-S11 VFD driver
+# cmdrsk_vfd.hal — example HAL file for Commander SK VFD via RS-485 Modbus RTU
 #
-# $Id: vfs11_vfd.hal,v 1.1 2009-09-19 23:00:27 mah Exp $
+# Load the driver, waiting until it has registered all HAL pins (-W flag).
+# The -n flag sets the HAL component name used for all pin references below.
 #
-loadusr -Wn spindle-vfd vfs11_vfd -n spindle-vfd
+loadusr -Wn cmdrsk-vfd cmdrsk_vfd -n cmdrsk-vfd
 
-# connect the spindle direction pins to the VFD
-net vfs11-fwd spindle-vfd.spindle-fwd <= motion.spindle-forward
-net vfs11-rev spindle-vfd.spindle-rev <= motion.spindle-reverse
+# ---------------------------------------------------------------------------
+# Machine-on awareness
+# ---------------------------------------------------------------------------
+# The VFD is only powered when LinuxCNC machine power is on.  The 'enabled'
+# pin suspends all Modbus traffic when false, preventing spurious timeout
+# errors while the drive is unpowered.
+#
+net machine-is-on  halui.machine.is-on  =>  cmdrsk-vfd.enabled
 
-# connect the spindle on pin to the VF-S11
-net vfs11-run spindle-vfd.spindle-on <= motion.spindle-on
+# ---------------------------------------------------------------------------
+# Spindle motion commands (from LinuxCNC motion controller)
+# ---------------------------------------------------------------------------
+net spindle-fwd    motion.spindle-forward    =>  cmdrsk-vfd.spindle-fwd
+net spindle-rev    motion.spindle-reverse    =>  cmdrsk-vfd.spindle-rev
+net spindle-on     motion.spindle-on         =>  cmdrsk-vfd.spindle-on
+net spindle-rpm    motion.spindle-speed-out  =>  cmdrsk-vfd.speed-command
 
-# connect the VF-S11 at speed to the motion at speed
-net vfs11-at-speed motion.spindle-at-speed <= spindle-vfd.at-speed
+# ---------------------------------------------------------------------------
+# Feedback to motion controller
+# ---------------------------------------------------------------------------
+net spindle-at-speed  cmdrsk-vfd.at-speed  =>  motion.spindle-at-speed
 
-# connect the spindle RPM to the VF-S11
-net vfs11-RPM spindle-vfd.speed-command <= motion.spindle-speed-out
+# ---------------------------------------------------------------------------
+# Fault handling
+# ---------------------------------------------------------------------------
+# cmdrsk-vfd.fault          — goes TRUE when drive is in a tripped state
+# cmdrsk-vfd.fault-reset    — pulse TRUE to reset the trip (rising edge only)
+# cmdrsk-vfd.drive-ok       — TRUE when drive is healthy (not tripped)
+#
+# Trip reset: when fault-reset goes high, the driver writes 100 to Pr 10.38
+# which is the correct serial-interface reset method per the Commander SK
+# Advanced User Guide, section 4.1, method 4.
+#
+# Wire fault-reset to whatever initiates your reset sequence, e.g.:
+#   net vfd-fault-reset  halui.estop.reset  =>  cmdrsk-vfd.fault-reset
+# or leave it unconnected and reset from a panel button / G-code M-code.
 
-# connect the VF-S11 DC brake
-# used by default if spindle is stopped - uncomment to use
-#net vfs11-spindle-brake motion.spindle-brake => spindle-vfd.dc-brake
+# ---------------------------------------------------------------------------
+# Power drawbar / hardware interlock
+# ---------------------------------------------------------------------------
+# cmdrsk-vfd.hardware-enable reflects the state of the Commander SK hardware
+# enable terminal (Pr 6.29).  On this machine it is wired to the power
+# drawbar interlock: the terminal opens whenever the drawbar is activated to
+# eject or clamp a tool.
+#
+# *** DO NOT wire this to e-stop. ***
+#
+# This is a NORMAL, expected, momentary event during tool changes.  The drive
+# inhibits itself automatically; LinuxCNC does not need to intervene.
+# Use this pin for:
+#   - Displaying "spindle inhibited" state on the operator panel/GUI
+#   - Preventing an inadvertent spindle-start command while the drawbar is
+#     active (e.g. via a safety interlock in your HAL ladder logic)
+#
+# Example: drive an indicator output when the drawbar is active:
+#   net vfd-hw-enable  cmdrsk-vfd.hardware-enable  =>  pyvcp.spindle-inhibit-led
 
-# to use the VFS11 jog mode for spindle orient 
-# see orient.9 and motion.9
-net spindle-orient motion.spindle-orient spindle-vfd.max-speed spindle-vfd.jog-mode
-
-# take precedence over control panel
-setp spindle-vfd.enable 1
+# ---------------------------------------------------------------------------
+# Useful monitoring pins (wire to panel indicators or Probe Basic DROs)
+# ---------------------------------------------------------------------------
+# cmdrsk-vfd.motor-RPM             — actual motor RPM
+# cmdrsk-vfd.frequency-out         — actual output frequency (Hz)
+# cmdrsk-vfd.current-load-percentage — drive load %
+# cmdrsk-vfd.drive-active          — TRUE when inverter output is live
+# cmdrsk-vfd.spindle-running-rev   — TRUE when actually running in reverse
+# cmdrsk-vfd.modbus-ok             — TRUE after 10 consecutive good transactions
+# cmdrsk-vfd.max-rpm               — max RPM read from VFD EEPROM at startup
+# cmdrsk-vfd.error-count           — cumulative Modbus error count

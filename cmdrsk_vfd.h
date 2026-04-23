@@ -1,6 +1,14 @@
 #ifndef _cmdrsk_vfd_h
 #define _cmdrsk_vfd_h
 
+#include <stdio.h>  /* for snprintf in sk_trip_name()/sk_trip_desc() */
+
+/*
+ * Commander SK parameter register addresses.
+ * CT Modbus addressing: Pr X.Y -> register = X*100 + Y
+ * The GETPARAM/SETPARAM macros subtract 1 for the wire-level address.
+ */
+
 #define PR_MAX_SET_SPEED	106
 #define PR_MIN_SET_SPEED	107
 
@@ -33,6 +41,11 @@
 #define PR_SEQ_N_STOP		639
 #define PR_SEQ_LATCHING		640
 #define PR_CONTROL_WORD		642
+
+/* Pr 6.15: software drive enable (RW, reflects internal enable state) */
+#define PR_DRIVE_ENABLE		615
+/* Pr 6.29: hardware enable terminal state (reflects physical enable input) */
+#define PR_HARDWARE_ENABLE	629
 #define PR_CONTROL_WORD_ENABLE	643
 
 
@@ -63,6 +76,12 @@
 #define PR_SW_SUBVERSION	1134
 #define PR_DSP_VERSION		1135
 
+/*
+ * Pr 10.38: User trip / drive reset register.
+ * Write 100 to perform a drive reset (per Commander SK Advanced User Guide
+ * section 4.1, method 4). Valid user trip codes are 1-255 except 100 and 255.
+ */
+#define PR_USER_TRIP		1038
 
 
 // PR_STATUS_WORD bit values
@@ -97,14 +116,12 @@
 #define ST_ZERO_SPEED		(1<<2)
 #define ST_DRIVE_ACTIVE		(1<<1)
 #define ST_DRIVE_OK		(1<<0)
-#endif
-
 
 
 // PR_CONTROL_WORD bit values
 // 15	Reserved
 // 14	Keypad watchdog
-// 13	Pr10.33 - Reset drive
+// 13	Pr10.33 - Reset drive  (0->1 edge resets; prefer Pr10.38=100 via serial)
 // 12	Trip drive
 // 11	Reserved
 // 10	Reserved
@@ -131,12 +148,103 @@
 #define CTL_DRIVE_ENABLE	(1<<0)
 
 
-
 // PR_REFERENCE_SELECTOR values
-// 0: A1.A2
-// 1: A1.Pr
-// 2: A2.Pr
-// 3: Pr
-// 4: PAd
-// 5: Precision reference (the one we want for modbus control)
+// 5: Precision reference (selected for Modbus speed control)
 #define SEL_REFERENCE_PRECISION	0x05
+
+
+/*
+ * Commander SK trip code lookup table.
+ * Source: Commander SK Advanced User Guide, Issue 10, Table 10-17.
+ *
+ * Usage: iterate until code==0 (sentinel).
+ * User trips t040-t089 (codes 40-89) are handled as a range.
+ * Hardware faults HF01-HF19 (fatal, display only) appear as HFxx on panel
+ * but the numeric codes stored in Pr 10.20 are not publicly documented;
+ * they will fall through to the unknown-code path.
+ */
+typedef struct {
+    int code;
+    const char *name;
+    const char *description;
+} sk_trip_t;
+
+/* Note: Hardware enable (Pr 6.29) going low during power drawbar operation
+ * is a NORMAL, expected, ephemeral condition for tool changes.  It must NOT
+ * be wired to e-stop.  Expose it as a HAL output pin for operator display
+ * and spindle-inhibit interlock logic only. */
+
+static const sk_trip_t sk_trip_table[] = {
+    {1,   "UU",    "DC bus under voltage"},
+    {2,   "OU",    "DC bus over voltage"},
+    {3,   "OI.AC", "AC instantaneous over current"},
+    {4,   "OI.br", "Braking resistor instantaneous over current"},
+    {6,   "Et",    "External trip"},
+    {7,   "O.SPd", "Overspeed"},
+    {18,  "tunE",  "Auto-tune stopped before completion"},
+    {19,  "It.br", "I2t on braking resistor"},
+    {20,  "It.AC", "I2t on drive output current"},
+    {21,  "O.ht1", "Drive over-heat (IGBT thermal model)"},
+    {22,  "O.ht2", "Drive over-heat (heatsink temperature)"},
+    {24,  "th",    "Motor thermistor trip"},
+    {26,  "O.Ld1", "+24V or digital output overload"},
+    {27,  "O.ht3", "Drive over-heat (DC bus thermal model)"},
+    {28,  "cL1",   "Analog input 1 current loss"},
+    {30,  "SCL",   "Serial comms timeout (external keypad)"},
+    {31,  "EEF",   "Internal EEPROM failure (load defaults to clear)"},
+    {32,  "PH",    "Input phase loss or high imbalance"},
+    {33,  "rS",    "Stator resistance measurement failure"},
+    {35,  "CL.bt", "Trip initiated from control word bit 12"},
+    {100, "(reset)","Drive reset command acknowledged"},
+    {102, "O.ht4", "Power module rectifier over temperature"},
+    {182, "C.Err", "SmartStick data error"},
+    {183, "C.dAt", "SmartStick data does not exist"},
+    {185, "C.Acc", "SmartStick read/write fail"},
+    {186, "C.rtg", "SmartStick rating mismatch"},
+    {189, "O.cL",  "Overload on current loop analog input"},
+    {199, "dESt",  "Destination parameter clash"},
+    {200, "SL.HF", "Solutions Module hardware fault"},
+    {201, "SL.tO", "Solutions Module watchdog timeout"},
+    {202, "SL.Er", "Solutions Module error (see Pr 15.50)"},
+    {203, "SL.nF", "Solutions Module not installed"},
+    {204, "SL.dF", "Solutions Module different type installed"},
+    {0,   NULL,    NULL}  /* sentinel */
+};
+
+/* Return display name for a trip code. */
+static inline const char *sk_trip_name(int code)
+{
+    const sk_trip_t *t;
+    static char buf[16];
+    if (code >= 40 && code <= 89) {
+        snprintf(buf, sizeof(buf), "t%03d", code);
+        return buf;
+    }
+    if (code >= 220 && code <= 232) {
+        snprintf(buf, sizeof(buf), "HF%d", code - 200);
+        return buf;
+    }
+    for (t = sk_trip_table; t->name != NULL; t++) {
+        if (t->code == code)
+            return t->name;
+    }
+    snprintf(buf, sizeof(buf), "?(code %d)", code);
+    return buf;
+}
+
+/* Return description for a trip code. */
+static inline const char *sk_trip_desc(int code)
+{
+    const sk_trip_t *t;
+    if (code >= 40 && code <= 89)
+        return "User-defined PLC ladder trip";
+    if (code >= 220 && code <= 232)
+        return "Fatal hardware fault - power cycle required";
+    for (t = sk_trip_table; t->name != NULL; t++) {
+        if (t->code == code)
+            return t->description;
+    }
+    return "Unknown trip code";
+}
+
+#endif /* _cmdrsk_vfd_h */

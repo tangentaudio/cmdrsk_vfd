@@ -96,37 +96,50 @@
 /* HAL data struct */
 typedef struct {
     hal_s32_t 	*status;
-    hal_float_t	*freq_cmd;	// frequency command
-    hal_float_t	*freq_out;	// actual output frequency
+    hal_float_t	*freq_cmd;		// frequency command
+    hal_float_t	*freq_out;		// actual output frequency
     hal_float_t	*RPM;
     hal_float_t	*inv_load_pct;
     hal_float_t	*load_current_pct;
-    hal_float_t *max_rpm;	// calculated based on VFD max frequency setup parameter
-    hal_float_t *min_rpm;	// see above
+    hal_float_t *max_rpm;		// calculated from VFD max frequency (Pr 1.06)
+    hal_float_t *min_rpm;		// calculated from VFD min frequency (Pr 1.07)
     hal_s32_t	*trip_code;
     hal_s32_t	*alarm_code;
-    hal_bit_t	*at_speed;	// when drive freq_cmd == freq_out and running
-    hal_bit_t	*is_stopped;	// when drive freq out is 0
-    hal_bit_t	*modbus_ok;	// the last MODBUS_OK transactions returned successfully
-    hal_float_t	*speed_command;	// speed command input
+    hal_bit_t	*at_speed;		// ST_AT_SET_SPEED from status word
+    hal_bit_t	*is_stopped;		// ST_ZERO_SPEED from status word
+    hal_bit_t	*modbus_ok;		// asserts after MODBUS_MIN_OK good transactions
+    hal_float_t	*speed_command;		// speed command input (RPM)
 
-    hal_bit_t	*spindle_on;	// spindle 1=on, 0=off
-    hal_bit_t	*spindle_fwd;	// direction, 0=fwd, 1=rev
-    hal_bit_t 	*spindle_rev;	// on when in rev and running
+    hal_bit_t	*spindle_on;		// IN: spindle 1=on, 0=off
+    hal_bit_t	*spindle_fwd;		// IN: commanded forward direction
+    hal_bit_t 	*spindle_rev;		// IN: commanded reverse direction
 
-    hal_s32_t	*errorcount;    // number of failed Modbus transactions - hints at logical errors
+    hal_s32_t	*errorcount;		// failed Modbus transaction count
+
+    /* --- new pins --- */
+    hal_bit_t	*enabled;		// IN: machine-on / VFD powered (skip Modbus when 0)
+    hal_bit_t	*fault;			// OUT: drive is in tripped state (!ST_DRIVE_OK)
+    hal_bit_t	*fault_reset;		// IN: rising edge sends reset (writes 100 to Pr 10.38)
+    hal_bit_t	*drive_ok;		// OUT: Pr 10.01 - drive not tripped
+    hal_bit_t	*drive_active;		// OUT: Pr 10.02 - inverter output is live
+    hal_bit_t	*spindle_running_rev;	// OUT: Pr 10.14 ST_DIRECTION_RUNNING - actual run direction
+    hal_bit_t	*hardware_enable;	// OUT: Pr 6.29 - hardware enable terminal state
+    /* NOTE: hardware_enable (Pr 6.29) goes low during power drawbar operation.
+     *       This is a NORMAL, ephemeral tool-change interlock.  Do NOT wire
+     *       this to e-stop.  Use it for spindle-inhibit display only. */
+    hal_bit_t	*drive_enable;		// OUT: Pr 6.15 - software drive enable state
 
     hal_float_t	looptime;
-    hal_float_t	speed_tolerance; 	
+    hal_float_t	speed_tolerance;
     hal_float_t	motor_rated_hz;		// speeds are scaled in Hz, not RPM
-    hal_float_t	motor_rated_rpm;	// nameplate RPM at default Hz
-    
-    hal_float_t	rpm_limit;		// do-not-exceed output frequency
+    hal_float_t	motor_rated_rpm;	// nameplate RPM at rated Hz
 
-    hal_float_t	*lower_limit_hz;	// VFD setup parameter - minimum output frequency in HZ
-    hal_float_t	*upper_limit_hz;	// VFD setup parameter - maximum output frequency in HZ
-     
-    hal_bit_t   *max_speed;             // 1: run as fast as possible, ignore unimportant registers
+    hal_float_t	rpm_limit;		// do-not-exceed RPM
+
+    hal_float_t	*lower_limit_hz;	// VFD min output frequency in Hz
+    hal_float_t	*upper_limit_hz;	// VFD max output frequency in Hz
+
+    hal_bit_t   *max_speed;		// 1: run as fast as possible, skip slow registers
 } haldata_t;
 
 // configuration and execution state
@@ -135,7 +148,7 @@ typedef struct params {
     int modbus_debug;
     int debug;
     int slave;
-    int pollcycles; 
+    int pollcycles;
     char *device;
     int baud;
     int bits;
@@ -154,13 +167,12 @@ typedef struct params {
     haldata_t *haldata;
     int hal_comp_id;
     int read_initial_done;
-    int old_err_reset; 
-    uint16_t old_cmd1_reg;		// copy of last write to FA00 */
     int modbus_ok;
-    uint16_t failed_reg;		// remember register for failed modbus transaction for debugging
-    int	last_errno;
-
+    uint16_t failed_reg;		// register address of last failed transaction
+    int last_errno;
     int report_device;
+    int old_fault_reset;		// previous fault-reset pin value for edge detection
+    int was_enabled;			// previous enabled pin value for transition detection
 } params_type, *param_pointer;
 
 // default options; read from inifile or command line
@@ -188,12 +200,12 @@ static params_type param = {
     .haldata = NULL,
     .hal_comp_id = -1,
     .read_initial_done = 0,
-    .old_err_reset = 0,
-    .old_cmd1_reg = 0,
-    .modbus_ok = 0,    // set modbus-ok bit if last MODBUS_OK transactions went well 
-    .failed_reg =0,
+    .modbus_ok = 0,
+    .failed_reg = 0,
     .last_errno = 0,
     .report_device = 0,
+    .old_fault_reset = 0,
+    .was_enabled = 0,
 };
 
 
@@ -384,37 +396,47 @@ int write_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
 {
     static hal_float_t last_freq_cmd = -1.0;
     static uint16_t last_control_reg = 0xFFFF;
-    
+
     int freq_reg;
     uint16_t control_reg, curr_param;
 
+    /* --- Fault reset (rising edge of fault-reset pin) ---
+     * The correct serial reset method per Commander SK Advanced User Guide
+     * section 4.1, method 4: write 100 to Pr 10.38 (PR_USER_TRIP).
+     * This is preferable to control-word bit 13 because it works even when
+     * the control word enable (Pr 6.43) is not active. */
+    if (*(haldata->fault_reset) && !p->old_fault_reset) {
+        DBG("write_data: fault-reset rising edge - sending drive reset (Pr 10.38 = 100)\n");
+        SETPARAM(PR_USER_TRIP, 100);
+        /* Force re-send of freq and control word on next cycle */
+        last_freq_cmd = -1.0;
+        last_control_reg = 0xFFFF;
+    }
+    p->old_fault_reset = *(haldata->fault_reset);
 
+    /* --- Speed reference --- */
     *(haldata->freq_cmd) = (*(haldata->speed_command) * *(haldata->upper_limit_hz)) / *(haldata->max_rpm);
 
     if (*(haldata->freq_cmd) != last_freq_cmd) {
-        // set the coarse speed ref
-        freq_reg = abs(*(haldata->freq_cmd) * 10.0);
+        /* Set coarse precision reference (Pr 1.18, units = 0.1 Hz) */
+        freq_reg = (int)fabs(*(haldata->freq_cmd) * 10.0);
         SETPARAM(PR_PRECISION_REF_COARSE, freq_reg);
         usleep(10000);
-
-        // set the precision reference as the speed reference
+        /* Select precision reference as the active speed source (Pr 1.14 = 5) */
         SETPARAM(PR_REFERENCE_SELECTOR, SEL_REFERENCE_PRECISION);
         usleep(10000);
-        
         DBG("write_data: freq_cmd=%f, freq_reg=%d\n", *(haldata->freq_cmd), freq_reg);
     }
     last_freq_cmd = *(haldata->freq_cmd);
 
-    
+    /* --- Control word --- */
     control_reg = CTL_DRIVE_ENABLE | CTL_AUTO_MANUAL;
     if (*(haldata->spindle_on) && *(haldata->spindle_fwd) && !*(haldata->spindle_rev)) {
-        // spindle forward
         control_reg |= CTL_N_STOP | CTL_RUN_FORWARD;
     } else if (*(haldata->spindle_on) && *(haldata->spindle_rev) && !*(haldata->spindle_fwd)) {
-        // spindle reverse
         control_reg |= CTL_N_STOP | CTL_RUN_REVERSE;
     } else {
-        // something invalid - stop
+        /* Stopped or invalid direction combination */
         control_reg &= ~CTL_N_STOP;
     }
 
@@ -426,133 +448,6 @@ int write_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
         DBG("write_data: control_reg=%4.4X\n", control_reg);
     }
     last_control_reg = control_reg;
-    
-    /*
-    hal_float_t hzcalc;
-    int cmd1_reg;
-    int freq_reg, freq_cap;
-
-    if (!*(haldata->enabled)) {
-	// send 0 to FA00 register - no bus control
-	if (modbus_write_register(ctx, REG_COMMAND1, 0) < 0) {
-	    p->failed_reg = REG_COMMAND1;
-	    (*haldata->errorcount)++;
-	    p->last_errno = errno;
-	    return errno;
-	}
-	return 0;
-    }
- retry:
-    // set frequency register
-    if (haldata->motor_nameplate_hz < 10)
-	haldata->motor_nameplate_hz = 50;
-    if ((haldata->motor_nameplate_RPM < 600) || (haldata->motor_nameplate_RPM > 5000))
-	haldata->motor_nameplate_RPM = 1410;
-    hzcalc = haldata->motor_nameplate_hz/haldata->motor_nameplate_RPM;
-
-    freq_reg =  abs((int)(*(haldata->speed_command) * hzcalc * 100));
-    freq_cap =  abs((int)(haldata->rpm_limit * hzcalc * 100));
-
-    // limit frequency to frequency set via max-rpm
-    if (freq_reg > freq_cap)
-	freq_reg = freq_cap;
-
-    *(haldata->freq_cmd)  =  freq_reg / 100.0;
-
-    // prepare command register
-    //  force Modbus control - this disables the panel
-    cmd1_reg = (CMD_COMMAND_PRIORITY|CMD_FREQUENCY_PRIORITY);	
-    if (*haldata->spindle_on){
-	cmd1_reg|= (*haldata->jog_mode) ? CMD_JOG_RUN : CMD_RUN;
-    }
-
-    // if 1, choose ramp times as per F500/F501
-    // fix for PID loops where long ramp times cause oscillation
-    if (haldata->acc_dec_pattern){
-	cmd1_reg|= CMD_ACCEL_PATTERN_2;
-    }
-
-    // rev follows fwd
-    // two bits for one direction is a mess in the first place
-    *(haldata->spindle_rev) = *(haldata->spindle_fwd) ? 0 : 1;
-    *(haldata->spindle_fwd) = *(haldata->spindle_rev) ? 0 : 1;
-
-    if (*haldata->spindle_rev) {
-	cmd1_reg |= CMD_REVERSE;
-    } else {
-	cmd1_reg &= (~CMD_REVERSE);	// direction bit = 0 -> forward
-    }
-
-    // DC brake - turn spindle_on off as well
-    if  (*(haldata->DC_brake)) {
-	cmd1_reg |= CMD_DC_BRAKE;  	// set DC brake bit
-	cmd1_reg &= ~(CMD_RUN | CMD_JOG_RUN); 	
-	*(haldata->spindle_on) = 0;
-	*(haldata->at_speed) = 0;
-    } else {
-	cmd1_reg &= ~CMD_DC_BRAKE;
-    }
-
-    // send CMD_FAULT_RESET and CMD_EMERGENCY_STOP only once so the poor thing comes back
-    // out of reset/estop status eventually
-    if (*(haldata->err_reset) && !(p->old_cmd1_reg  & CMD_FAULT_RESET ))	{ // not sent yet
-	cmd1_reg |= CMD_FAULT_RESET;		// fault reset bit = 1 -> clear fault
-	*(haldata->err_reset) = 0;
-    } else {
-	cmd1_reg &= ~CMD_FAULT_RESET;
-    }
-
-    if (*(haldata->estop) && !(p->old_cmd1_reg  & CMD_EMERGENCY_STOP )) {	// not sent yet)
-	cmd1_reg |= CMD_EMERGENCY_STOP;		// estop bit -> trip VFD into estop mode
-	*(haldata->estop) = 0;
-	*(haldata->spindle_on) = 0;
-	*(haldata->at_speed) = 0;
-    } else {
-	cmd1_reg &= ~CMD_EMERGENCY_STOP;
-    }
-
-    DBG("write_data: cmd1_reg=0x%4.4X old cmd1_reg=0x%4.4X\n", cmd1_reg,p->old_cmd1_reg);
-
-    if (modbus_write_register(ctx, REG_COMMAND1, cmd1_reg) < 0) {
-	// modbus transaction timed out. This may happen if VFD is in E-Stop.
-	// if VFD was in E-Stop, and a fault reset was sent, wait about 2 seconds for recovery
-	// we must assume that any command and frequency values sent were cleared, so we restart
-	// the operation.
-	// note that sending the CMD_EMERGENCY_STOP bit in cmd1_reg causes an immediate reboot
-	// without a Modbus reply (if the VFD actually was in e-stop) so we ignore this error.
-	if (cmd1_reg & CMD_EMERGENCY_STOP) {
-	    sleep(2);
-	    goto retry;
-	}
-	p->failed_reg = REG_COMMAND1;
-	(*haldata->errorcount)++;
-	p->last_errno = errno;
-	return errno;
-    } 
-
-    // remember so we can toggle fault/estop reset just once
-    // otherwise the VFD keeps rebooting as long as the fault reset/estop reset bits are sent
-    p->old_cmd1_reg = cmd1_reg;
-
-    if ((modbus_write_register(ctx, REG_FREQUENCY, freq_reg)) < 0) {
-	p->failed_reg = REG_FREQUENCY;
-	(*haldata->errorcount)++;
-	p->last_errno = errno;
-	return errno;
-    } 
-
-    if ((*(haldata->freq_cmd) > 0.01) && ((1.0 - *(haldata->freq_out) / *(haldata->freq_cmd))  < haldata->speed_tolerance)){
-	*(haldata->at_speed) = 1;
-    } else {
-	*(haldata->at_speed) = 0;
-    }
-
-    if (*(haldata->spindle_on) == 0){ // JET reset at-speed
-	*(haldata->at_speed) = 0;
-    }
-    return 0;
-
-    */
 
     return 0;
 
@@ -561,7 +456,6 @@ int write_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
     (*haldata->errorcount)++;
     p->last_errno = errno;
     return errno;
-    
 }
 
 #define GETPARAM(param,into)					\
@@ -637,49 +531,66 @@ int read_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
     GETPARAM(PR_MOTOR_FREQUENCY, &freq);
     *(haldata->freq_out) = freq / 10.0;
 
-    // DBG("read_data: status_word=%4.4x freq=%4.4x\n", status_word, freq);
+    /* Decode status word bits */
+    *(haldata->drive_ok)     = (status_word & ST_DRIVE_OK)     ? 1 : 0;
+    *(haldata->drive_active) = (status_word & ST_DRIVE_ACTIVE) ? 1 : 0;
+    *(haldata->is_stopped)   = (status_word & ST_ZERO_SPEED)   ? 1 : 0;
+    *(haldata->at_speed)     = (status_word & ST_AT_SET_SPEED)  ? 1 : 0;
+    *(haldata->spindle_running_rev) = (status_word & ST_DIRECTION_RUNNING) ? 1 : 0;
 
-    
-    *(haldata->is_stopped) = status_word & ST_ZERO_SPEED;
-    *(haldata->at_speed) = status_word & ST_AT_SET_SPEED;
-    
-    // check for drive trip
-    if (! status_word & ST_DRIVE_OK) {
+    /* Fault pin is the inverse of drive-ok */
+    *(haldata->fault) = *(haldata->drive_ok) ? 0 : 1;
+
+    /* Check for drive trip and log trip codes */
+    if (!(status_word & ST_DRIVE_OK)) {
         uint16_t trip_codes[10];
-
-        // get last ten trip codes
-        for (int i=0; i<10; i++) {
+        int i;
+        for (i = 0; i < 10; i++) {
             GETPARAM(PR_LAST_TRIP + i, &trip_codes[i]);
         }
-
-        // report the most recent code
-        // TODO: do something more useful with the results
         *(haldata->alarm_code) = trip_codes[0];
+        if (p->debug || trip_codes[0] != *(haldata->trip_code)) {
+            fprintf(stderr, "%s: FAULT trip=%s (%s)\n",
+                    p->progname,
+                    sk_trip_name(trip_codes[0]),
+                    sk_trip_desc(trip_codes[0]));
+        }
+        *(haldata->trip_code) = trip_codes[0];
     }
 
+    /* Slow registers - only every pollcycles, and not in max-speed mode */
     if ((pollcount == 0) && !(*haldata->max_speed)) {
-	// less urgent registers
         GETPARAM(PR_PERCENT_LOAD, &val);
         *(haldata->load_current_pct) = val / 10.0;
 
         GETPARAM(PR_MOTOR_SPEED, &val);
         *(haldata->RPM) = val * 1.0;
-    } else 
-	pollcount++;
-    
+
+        /* Hardware enable terminal (Pr 6.29) - reflects physical interlock state.
+         * Goes low during power drawbar use - this is normal and expected. */
+        GETPARAM(PR_HARDWARE_ENABLE, &val);
+        *(haldata->hardware_enable) = val ? 1 : 0;
+
+        /* Software drive enable (Pr 6.15) */
+        GETPARAM(PR_DRIVE_ENABLE, &val);
+        *(haldata->drive_enable) = val ? 1 : 0;
+    }
+
+    /* Always advance pollcount - fixes bug where slow registers were
+     * read on every cycle because the else branch never ran at pollcount==0 */
+    pollcount++;
     if (pollcount >= p->pollcycles)
-	pollcount = 0;
-    
+        pollcount = 0;
+
     p->last_errno = retval = 0;
     return 0;
-    
-    
+
  failed:
     p->failed_reg = curr_param;
     p->last_errno = errno;
     (*haldata->errorcount)++;
     if (p->debug)
-	fprintf(stderr, "%s: read_data: modbus_read_registers(0x%4.4x): %s\n", 
+	fprintf(stderr, "%s: read_data: modbus_read_registers(0x%4.4x): %s\n",
 		p->progname, curr_param, modbus_strerror(errno));
     return p->last_errno;
 }
@@ -707,18 +618,26 @@ int hal_setup(int id, haldata_t *h, const char *name)
     PIN(hal_pin_float_newf(HAL_OUT, &(h->min_rpm), id, "%s.min-rpm", name));
     PIN(hal_pin_bit_newf(HAL_OUT, &(h->modbus_ok), id, "%s.modbus-ok", name));
     PIN(hal_pin_float_newf(HAL_OUT, &(h->RPM), id, "%s.motor-RPM", name));
-    PIN(hal_pin_float_newf(HAL_IN, &(h->speed_command), id, "%s.speed-command", name));
-    PIN(hal_pin_bit_newf(HAL_IN, &(h->spindle_fwd), id, "%s.spindle-fwd", name));
-    PIN(hal_pin_bit_newf(HAL_IN, &(h->spindle_on), id, "%s.spindle-on", name));
-    PIN(hal_pin_bit_newf(HAL_IN, &(h->spindle_rev), id, "%s.spindle-rev", name)); //JET
+    PIN(hal_pin_float_newf(HAL_IN,  &(h->speed_command), id, "%s.speed-command", name));
+    PIN(hal_pin_bit_newf(HAL_IN,  &(h->spindle_fwd), id, "%s.spindle-fwd", name));
+    PIN(hal_pin_bit_newf(HAL_IN,  &(h->spindle_on), id, "%s.spindle-on", name));
+    PIN(hal_pin_bit_newf(HAL_IN,  &(h->spindle_rev), id, "%s.spindle-rev", name));
     PIN(hal_pin_s32_newf(HAL_OUT, &(h->status), id, "%s.status", name));
     PIN(hal_pin_s32_newf(HAL_OUT, &(h->trip_code), id, "%s.trip-code", name));
-    PIN(hal_pin_bit_newf(HAL_IN, &(h->max_speed), id, "%s.max-speed", name));
+    PIN(hal_pin_bit_newf(HAL_IN,  &(h->max_speed), id, "%s.max-speed", name));
     PIN(hal_pin_s32_newf(HAL_OUT, &(h->errorcount), id, "%s.error-count", name));
     PIN(hal_pin_float_newf(HAL_OUT, &(h->upper_limit_hz), id, "%s.frequency-limit-high", name));
     PIN(hal_pin_float_newf(HAL_OUT, &(h->lower_limit_hz), id, "%s.frequency-limit-low", name));
+    /* new pins */
+    PIN(hal_pin_bit_newf(HAL_IN,  &(h->enabled), id, "%s.enabled", name));
+    PIN(hal_pin_bit_newf(HAL_OUT, &(h->fault), id, "%s.fault", name));
+    PIN(hal_pin_bit_newf(HAL_IN,  &(h->fault_reset), id, "%s.fault-reset", name));
+    PIN(hal_pin_bit_newf(HAL_OUT, &(h->drive_ok), id, "%s.drive-ok", name));
+    PIN(hal_pin_bit_newf(HAL_OUT, &(h->drive_active), id, "%s.drive-active", name));
+    PIN(hal_pin_bit_newf(HAL_OUT, &(h->spindle_running_rev), id, "%s.spindle-running-rev", name));
+    PIN(hal_pin_bit_newf(HAL_OUT, &(h->hardware_enable), id, "%s.hardware-enable", name));
+    PIN(hal_pin_bit_newf(HAL_OUT, &(h->drive_enable), id, "%s.drive-enable", name));
 
-    // the following limit must be set manually from the panel since its in EEPROM
     PIN(hal_param_float_newf(HAL_RW, &(h->looptime), id, "%s.loop-time", name));
     PIN(hal_param_float_newf(HAL_RW, &(h->motor_rated_hz), id, "%s.rated-hz", name));
     PIN(hal_param_float_newf(HAL_RW, &(h->motor_rated_rpm), id, "%s.rated-rpm", name));
@@ -732,7 +651,7 @@ int hal_setup(int id, haldata_t *h, const char *name)
 int set_defaults(param_pointer p)
 {
     haldata_t *h = p->haldata;
-    
+
     *(h->status) = 0;
     *(h->freq_cmd) = 0;
     *(h->freq_out) = 0;
@@ -747,22 +666,52 @@ int set_defaults(param_pointer p)
     *(h->is_stopped) = 0;
     *(h->speed_command) = 0;
     *(h->modbus_ok) = 0;
-
     *(h->spindle_on) = 0;
     *(h->spindle_fwd) = 1;
     *(h->spindle_rev) = 0;
     *(h->errorcount) = 0;
     *(h->max_speed) = 0;
+    /* new pins */
+    *(h->enabled) = 0;
+    *(h->fault) = 0;
+    *(h->fault_reset) = 0;
+    *(h->drive_ok) = 0;
+    *(h->drive_active) = 0;
+    *(h->spindle_running_rev) = 0;
+    *(h->hardware_enable) = 0;
+    *(h->drive_enable) = 0;
 
     h->looptime = 0.010;
-    h->speed_tolerance = 0.01;      // output frequency within 1% of target frequency
-    // h->motor_nameplate_hz = 50;	    // folks in The Colonies typically would use 60Hz and 1730 rpm
-    //h->motor_nameplate_RPM = 1410;
+    h->speed_tolerance = 0.01;
     h->rpm_limit = MAX_RPM;
 
     p->failed_reg = 0;
-
     return 0;
+}
+
+/* Zero all output pins — called when enabled goes false (VFD unpowered).
+ * Does not touch input pins or HAL parameters. */
+static void zero_outputs(haldata_t *h)
+{
+    *(h->status) = 0;
+    *(h->freq_cmd) = 0;
+    *(h->freq_out) = 0;
+    *(h->RPM) = 0;
+    *(h->inv_load_pct) = 0;
+    *(h->load_current_pct) = 0;
+    *(h->upper_limit_hz) = 0;
+    *(h->lower_limit_hz) = 0;
+    *(h->trip_code) = 0;
+    *(h->alarm_code) = 0;
+    *(h->at_speed) = 0;
+    *(h->is_stopped) = 0;
+    *(h->modbus_ok) = 0;
+    *(h->fault) = 0;
+    *(h->drive_ok) = 0;
+    *(h->drive_active) = 0;
+    *(h->spindle_running_rev) = 0;
+    *(h->hardware_enable) = 0;
+    *(h->drive_enable) = 0;
 }
 
 int main(int argc, char **argv)
@@ -896,6 +845,36 @@ int main(int argc, char **argv)
     while (connection_state != DONE) {
 
 	while (connection_state == CONNECTED) {
+	    /* --- enabled-pin awareness ---
+	     * When the machine is off the VFD is unpowered.  Skip all Modbus
+	     * activity to avoid filling the error log with spurious timeouts.
+	     * Zero the output pins so stale values aren't visible in HAL. */
+	    if (!*(p->haldata->enabled)) {
+		if (p->was_enabled) {
+		    DBG("%s: enabled->false: suspending Modbus, zeroing outputs\n",
+			p->progname);
+		    zero_outputs(p->haldata);
+		    p->read_initial_done = 0; /* re-read VFD params on next enable */
+		    p->modbus_ok = 0;
+		}
+		p->was_enabled = 0;
+		/* Sleep at normal rate so we don't busy-spin */
+		if (p->haldata->looptime < 0.001) p->haldata->looptime = 0.001;
+		if (p->haldata->looptime > 2.0)   p->haldata->looptime = 2.0;
+		loop_timespec.tv_sec  = (time_t)(p->haldata->looptime);
+		loop_timespec.tv_nsec = (long)((p->haldata->looptime -
+					 loop_timespec.tv_sec) * 1000000000l);
+		nanosleep(&loop_timespec, &remaining);
+		continue;
+	    }
+
+	    /* Transitioning disabled -> enabled */
+	    if (!p->was_enabled) {
+		DBG("%s: enabled->true: resuming Modbus\n", p->progname);
+		p->was_enabled = 1;
+		p->read_initial_done = 0;
+	    }
+
 	    if ((retval = read_data(p->ctx, p->haldata, p))) {
 		p->modbus_ok = 0;
 	    } else {
