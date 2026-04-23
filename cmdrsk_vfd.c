@@ -111,6 +111,7 @@ typedef struct params {
     char        parity;
     int         stopbits;
     int         rts_mode;
+    int         rts_delay_us;           /* µs delay after RTS toggle */
     int         serial_mode;
     struct timeval response_timeout;
     struct timeval byte_timeout;
@@ -145,6 +146,7 @@ static params_type param = {
     .stopbits           = 2,
     .serial_mode        = -1,
     .rts_mode           = -1,
+    .rts_delay_us       = -1,
     .response_timeout   = { .tv_sec = 0, .tv_usec = 500000 },
     .byte_timeout       = { .tv_sec = 0, .tv_usec = 500000 },
     .progname           = "cmdrsk_vfd",
@@ -327,6 +329,8 @@ static int read_ini(param_pointer p)
                 p->progname, LIBMODBUS_VERSION_STRING);
     }
 #endif
+
+    iniFindInt(p->fp, "RTS_DELAY_US", p->section, &p->rts_delay_us);
 
     return 0;
 }
@@ -800,8 +804,32 @@ int main(int argc, char **argv)
     }
 #endif
 
+    if (p->rts_delay_us >= 0) {
+        modbus_rtu_set_rts_delay(p->ctx, p->rts_delay_us);
+        DBG("%s: RTS delay set to %d µs\n", p->progname, p->rts_delay_us);
+    }
+
     modbus_set_debug(p->ctx, p->modbus_debug);
+
+    /* Apply configured timeouts to the modbus context.
+     * Without this, libmodbus uses its compiled-in defaults which may
+     * not be appropriate for USB-to-RS485 adapters. */
+#if LIBMODBUS_VERSION_CHECK(3,1,2)
+    modbus_set_response_timeout(p->ctx,
+                                p->response_timeout.tv_sec,
+                                p->response_timeout.tv_usec);
+    modbus_set_byte_timeout(p->ctx,
+                            p->byte_timeout.tv_sec,
+                            p->byte_timeout.tv_usec);
+#else
+    modbus_set_response_timeout(p->ctx, &p->response_timeout);
+    modbus_set_byte_timeout(p->ctx, &p->byte_timeout);
+#endif
     DBG("%s: serial port %s connected\n", p->progname, p->device);
+    DBG("%s: response timeout: %ld.%06lds, byte timeout: %ld.%06lds\n",
+        p->progname,
+        (long)p->response_timeout.tv_sec, (long)p->response_timeout.tv_usec,
+        (long)p->byte_timeout.tv_sec, (long)p->byte_timeout.tv_usec);
 
     /* ---------------------------------------------------------- */
     /* Main poll loop                                              */
@@ -841,10 +869,14 @@ int main(int argc, char **argv)
             }
 
             /* Read VFD status */
-            if ((retval = read_data(p->ctx, p->haldata, p)))
+            if ((retval = read_data(p->ctx, p->haldata, p))) {
                 p->modbus_ok = 0;
-            else
+                /* Flush stale bytes to prevent corrupting the next
+                 * transaction after a timeout or CRC error. */
+                modbus_flush(p->ctx);
+            } else {
                 p->modbus_ok++;
+            }
 
             *(p->haldata->modbus_ok) = (p->modbus_ok > MODBUS_MIN_OK) ? 1 : 0;
 
