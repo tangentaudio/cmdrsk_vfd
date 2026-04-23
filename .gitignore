@@ -8,3 +8,7 @@ cmdrsk_vfd
 
 # OS artifacts
 .DS_Store
+
+# Test venv
+test/.venv/
+__pycache__/

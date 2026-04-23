@@ -1,57 +1,20 @@
 /*
-  cmdrsk_vfd.c
-  userspace HAL program to control an Emerson/Control Techniques
-  Commander SK VFD via RS485 control
-
-  Written by Stephen Richardson, (steve@tangentaudio.com)
-  December 14, 2013
-
-  ----------------------------------------------------------------------
-
-  adapted from Michael Haberler's vfs11_vfd.c
-
-  based on: vfs11_vfd.c
-
-  Michael Haberler,  adapted from Steve Padnos' gs2_vfd.c, 
-  including modifications from John Thornton (jet1024 AT semo DOT net)
-
-  Copyright (C) 2007, 2008 Stephen Wille Padnos, Thoth Systems, Inc.
-  Copyright (C) 2009,2010,2011,2012 Michael Haberler
-
-  Based on a work (test-modbus program, part of libmodbus) which is
-  Copyright (C) 2001-2005 Stéphane Raimbault <stephane.raimbault@free.fr>
-
-  This program is free software; you can redistribute it and/or
-  modify it under the terms of the GNU Lesser General Public
-  License as published by the Free Software Foundation, version 2.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-  General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public
-  License along with this program; if not, write to the Free Software
-  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307  USA.
-
-  see 'man cmdrsk_vfd' and the VFS11 section in the Drivers manual.
-
-  Add is-stopped pin John Thornton
-
-*/
-
+ * cmdrsk_vfd.c — LinuxCNC userspace HAL component for the
+ * Emerson / Control Techniques Commander SK VFD via RS-485 Modbus RTU.
+ *
+ * Steve Richardson <steve@tangentaudio.com>, December 2013
+ * Adapted from Michael Haberler's vfs11_vfd.c, itself adapted from
+ * Steve Padnos' gs2_vfd.c (with modifications from John Thornton).
+ *
+ * Copyright (C) 2007, 2008 Stephen Wille Padnos, Thoth Systems, Inc.
+ * Copyright (C) 2009-2012 Michael Haberler
+ * Copyright (C) 2013-2026 Steve Richardson
+ *
+ * Licensed under the GNU Lesser General Public License, version 2.
+ */
 
 #ifndef ULAPI
 #error This is intended as a userspace component only.
-#endif
-
-#ifdef DEBUG
-#define DBG(fmt, ...)					\
-    do {						\
-	if (param.debug) printf(fmt,  ## __VA_ARGS__);	\
-    } while(0)
-#else
-#define DBG(fmt, ...)
 #endif
 
 #include <stdio.h>
@@ -64,7 +27,6 @@
 #include <errno.h>
 #include <getopt.h>
 #include <math.h>
-#include <signal.h>
 #include <stdarg.h>
 
 #include "rtapi.h"
@@ -73,206 +35,206 @@
 #include <inifile.h>
 #include "cmdrsk_vfd.h"
 
-/* There's an assumption in the gs2_vfd code, namely that the interesting registers
- * are contiguous and all of them can be read with a single read_holding_registers()
- * operation.
- *
- * However, the interesting VF-S11 registers are not contiguous, and must be read
- * one-by-one, because the Toshiba Modbus implementation only supports single-value
- * modbus_read_registers() queries, slowing things down considerably. It seems that
- * other VFD's have similar restrictions.
- *
- * Then, not all registers are equally important. We would like to read the
- * VFD status and actual frequency on every Modbus turnaround, but there is no need to
- * the read CPU version and inverter model more than once at startup, and the load factor etc 
- * every so often. 
+#ifdef DEBUG
+#define DBG(fmt, ...)                                   \
+    do {                                                \
+        if (param.debug) printf(fmt, ## __VA_ARGS__);   \
+    } while (0)
+#else
+#define DBG(fmt, ...)
+#endif
+
+/*
+ * Commander SK registers are not contiguous and must be read individually.
+ * We prioritise status/frequency reads on every cycle and defer slower
+ * registers (load%, RPM, hardware-enable) to every Nth cycle.
  */
-#define POLLCYCLES 	10      // read less important parameters only on every 10th transaction
-#define MODBUS_MIN_OK	10      // assert the modbus-ok pin after 10 successful modbus transactions
+#define POLLCYCLES      10      /* slow-register read interval (cycles) */
+#define MODBUS_MIN_OK   10      /* consecutive OK transactions before modbus-ok asserts */
+#define MAX_RPM         20000   /* cap commanded RPM */
 
-#define MAX_RPM	        20000   // cap output RPM
-
-
-/* HAL data struct */
+/* HAL shared memory data */
 typedef struct {
-    hal_s32_t 	*status;
-    hal_float_t	*freq_cmd;		// frequency command
-    hal_float_t	*freq_out;		// actual output frequency
-    hal_float_t	*RPM;
-    hal_float_t	*inv_load_pct;
-    hal_float_t	*load_current_pct;
-    hal_float_t *max_rpm;		// calculated from VFD max frequency (Pr 1.06)
-    hal_float_t *min_rpm;		// calculated from VFD min frequency (Pr 1.07)
-    hal_s32_t	*trip_code;
-    hal_s32_t	*alarm_code;
-    hal_bit_t	*at_speed;		// ST_AT_SET_SPEED from status word
-    hal_bit_t	*is_stopped;		// ST_ZERO_SPEED from status word
-    hal_bit_t	*modbus_ok;		// asserts after MODBUS_MIN_OK good transactions
-    hal_float_t	*speed_command;		// speed command input (RPM)
+    /* Output pins — drive status */
+    hal_s32_t   *status;                /* raw status word (Pr 10.40) */
+    hal_float_t *freq_cmd;              /* frequency command sent to VFD (Hz) */
+    hal_float_t *freq_out;              /* actual output frequency (Hz) */
+    hal_float_t *RPM;                   /* actual motor RPM */
+    hal_float_t *inv_load_pct;          /* inverter load percentage (reserved) */
+    hal_float_t *load_current_pct;      /* drive load as % of rated current */
+    hal_float_t *max_rpm;               /* max RPM from VFD EEPROM (Pr 1.06) */
+    hal_float_t *min_rpm;               /* min RPM from VFD EEPROM (Pr 1.07) */
+    hal_s32_t   *trip_code;             /* most recent trip code (Pr 10.20) */
+    hal_s32_t   *alarm_code;            /* alias for trip_code */
+    hal_bit_t   *at_speed;              /* ST_AT_SET_SPEED from status word */
+    hal_bit_t   *is_stopped;            /* ST_ZERO_SPEED from status word */
+    hal_bit_t   *modbus_ok;             /* asserts after MODBUS_MIN_OK good txns */
+    hal_bit_t   *drive_ok;              /* Pr 10.01 — not tripped */
+    hal_bit_t   *drive_active;          /* Pr 10.02 — inverter output is live */
+    hal_bit_t   *fault;                 /* inverse of drive_ok */
+    hal_bit_t   *spindle_running_rev;   /* Pr 10.14 — actual run direction */
+    hal_bit_t   *hardware_enable;       /* Pr 6.29 — hardware enable terminal.
+                                         * Goes low during power drawbar use;
+                                         * this is NORMAL.  Do NOT wire to e-stop. */
+    hal_bit_t   *drive_enable;          /* Pr 6.15 — software drive enable */
+    hal_float_t *upper_limit_hz;        /* VFD max output frequency (Hz) */
+    hal_float_t *lower_limit_hz;        /* VFD min output frequency (Hz) */
+    hal_s32_t   *errorcount;            /* cumulative failed Modbus transaction count */
 
-    hal_bit_t	*spindle_on;		// IN: spindle 1=on, 0=off
-    hal_bit_t	*spindle_fwd;		// IN: commanded forward direction
-    hal_bit_t 	*spindle_rev;		// IN: commanded reverse direction
+    /* Input pins — commands from LinuxCNC */
+    hal_float_t *speed_command;         /* commanded spindle speed (RPM) */
+    hal_bit_t   *spindle_on;            /* spindle run command */
+    hal_bit_t   *spindle_fwd;           /* commanded forward */
+    hal_bit_t   *spindle_rev;           /* commanded reverse */
+    hal_bit_t   *enabled;               /* machine-on gate; skip Modbus when false */
+    hal_bit_t   *fault_reset;           /* rising edge → reset via Pr 10.38=100 */
+    hal_bit_t   *max_speed;             /* skip slow registers for max throughput */
 
-    hal_s32_t	*errorcount;		// failed Modbus transaction count
-
-    /* --- new pins --- */
-    hal_bit_t	*enabled;		// IN: machine-on / VFD powered (skip Modbus when 0)
-    hal_bit_t	*fault;			// OUT: drive is in tripped state (!ST_DRIVE_OK)
-    hal_bit_t	*fault_reset;		// IN: rising edge sends reset (writes 100 to Pr 10.38)
-    hal_bit_t	*drive_ok;		// OUT: Pr 10.01 - drive not tripped
-    hal_bit_t	*drive_active;		// OUT: Pr 10.02 - inverter output is live
-    hal_bit_t	*spindle_running_rev;	// OUT: Pr 10.14 ST_DIRECTION_RUNNING - actual run direction
-    hal_bit_t	*hardware_enable;	// OUT: Pr 6.29 - hardware enable terminal state
-    /* NOTE: hardware_enable (Pr 6.29) goes low during power drawbar operation.
-     *       This is a NORMAL, ephemeral tool-change interlock.  Do NOT wire
-     *       this to e-stop.  Use it for spindle-inhibit display only. */
-    hal_bit_t	*drive_enable;		// OUT: Pr 6.15 - software drive enable state
-
-    hal_float_t	looptime;
-    hal_float_t	speed_tolerance;
-    hal_float_t	motor_rated_hz;		// speeds are scaled in Hz, not RPM
-    hal_float_t	motor_rated_rpm;	// nameplate RPM at rated Hz
-
-    hal_float_t	rpm_limit;		// do-not-exceed RPM
-
-    hal_float_t	*lower_limit_hz;	// VFD min output frequency in Hz
-    hal_float_t	*upper_limit_hz;	// VFD max output frequency in Hz
-
-    hal_bit_t   *max_speed;		// 1: run as fast as possible, skip slow registers
+    /* HAL parameters (settable at runtime via halcmd setp) */
+    hal_float_t looptime;               /* poll loop sleep (seconds) */
+    hal_float_t speed_tolerance;        /* at-speed tolerance (fraction) */
+    hal_float_t motor_rated_hz;         /* motor nameplate frequency */
+    hal_float_t motor_rated_rpm;        /* motor nameplate RPM */
+    hal_float_t rpm_limit;              /* do-not-exceed RPM */
 } haldata_t;
 
-// configuration and execution state
+/* Configuration and runtime state */
 typedef struct params {
-    char *modname;
-    int modbus_debug;
-    int debug;
-    int slave;
-    int pollcycles;
-    char *device;
-    int baud;
-    int bits;
-    char parity;
-    int stopbits;
-    int rts_mode;
-    int serial_mode;
+    char        *modname;
+    int         modbus_debug;
+    int         debug;
+    int         slave;
+    int         pollcycles;
+    char        *device;
+    int         baud;
+    int         bits;
+    char        parity;
+    int         stopbits;
+    int         rts_mode;
+    int         serial_mode;
     struct timeval response_timeout;
     struct timeval byte_timeout;
-    char *progname;
-    char *section;
-    FILE *fp;
-    char *inifile;
-    int reconnect_delay;
-    modbus_t *ctx;
-    haldata_t *haldata;
-    int hal_comp_id;
-    int read_initial_done;
-    int modbus_ok;
-    uint16_t failed_reg;		// register address of last failed transaction
-    int last_errno;
-    int report_device;
-    int old_fault_reset;		// previous fault-reset pin value for edge detection
-    int was_enabled;			// previous enabled pin value for transition detection
+    char        *progname;
+    char        *section;
+    FILE        *fp;
+    char        *inifile;
+    int         reconnect_delay;
+    modbus_t    *ctx;
+    haldata_t   *haldata;
+    int         hal_comp_id;
+    int         read_initial_done;
+    int         modbus_ok;
+    uint16_t    failed_reg;             /* register of last failed transaction */
+    int         last_errno;
+    int         report_device;
+    int         old_fault_reset;        /* previous fault-reset for edge detect */
+    int         was_enabled;            /* previous enabled for transition detect */
 } params_type, *param_pointer;
 
-// default options; read from inifile or command line
+/* Default options — overridden by INI file or command line */
 static params_type param = {
-    .modname = NULL,
-    .modbus_debug = 0,
-    .debug = 0,
-    .slave = 1, 
-    .pollcycles = POLLCYCLES,
-    .device = "/dev/ttyS1",
-    .baud = 19200,
-    .bits = 8,
-    .parity = 'N',
-    .stopbits = 2,
-    .serial_mode = -1,
-    .rts_mode = -1,
-    .response_timeout = { .tv_sec = 0, .tv_usec = 500000 },
-    .byte_timeout = {.tv_sec = 0, .tv_usec = 500000},
-    .progname = "cmdrsk_vfd",
-    .section = "CMDRSK",
-    .fp = NULL,
-    .inifile = NULL,
-    .reconnect_delay = 1,
-    .ctx = NULL,
-    .haldata = NULL,
-    .hal_comp_id = -1,
-    .read_initial_done = 0,
-    .modbus_ok = 0,
-    .failed_reg = 0,
-    .last_errno = 0,
-    .report_device = 0,
-    .old_fault_reset = 0,
-    .was_enabled = 0,
+    .modname            = NULL,
+    .modbus_debug       = 0,
+    .debug              = 0,
+    .slave              = 1,
+    .pollcycles         = POLLCYCLES,
+    .device             = "/dev/ttyS1",
+    .baud               = 19200,
+    .bits               = 8,
+    .parity             = 'N',
+    .stopbits           = 2,
+    .serial_mode        = -1,
+    .rts_mode           = -1,
+    .response_timeout   = { .tv_sec = 0, .tv_usec = 500000 },
+    .byte_timeout       = { .tv_sec = 0, .tv_usec = 500000 },
+    .progname           = "cmdrsk_vfd",
+    .section            = "CMDRSK",
+    .fp                 = NULL,
+    .inifile            = NULL,
+    .reconnect_delay    = 1,
+    .ctx                = NULL,
+    .haldata            = NULL,
+    .hal_comp_id        = -1,
+    .read_initial_done  = 0,
+    .modbus_ok          = 0,
+    .failed_reg         = 0,
+    .last_errno         = 0,
+    .report_device      = 0,
+    .old_fault_reset    = 0,
+    .was_enabled        = 0,
 };
 
-
 static int connection_state;
-enum connstate {NOT_CONNECTED, OPENING, CONNECTING, CONNECTED, RECOVER, DONE};
+enum connstate { NOT_CONNECTED, OPENING, CONNECTING, CONNECTED, RECOVER, DONE };
 
 static char *option_string = "dhrmn:S:I:";
 static struct option long_options[] = {
-    {"debug", no_argument, 0, 'd'},
-    {"help", no_argument, 0, 'h'},
-    {"modbus-debug", no_argument, 0, 'm'},
-    {"report-device", no_argument, 0, 'r'},
-    {"ini", required_argument, 0, 'I'},     // default: getenv(INI_FILE_NAME)
-    {"section", required_argument, 0, 'S'}, // default section = LIBMODBUS
-    {"name", required_argument, 0, 'n'},    // cmdrsk_vfd
-    {0,0,0,0}
+    {"debug",         no_argument,       0, 'd'},
+    {"help",          no_argument,       0, 'h'},
+    {"modbus-debug",  no_argument,       0, 'm'},
+    {"report-device", no_argument,       0, 'r'},
+    {"ini",           required_argument, 0, 'I'},
+    {"section",       required_argument, 0, 'S'},
+    {"name",          required_argument, 0, 'n'},
+    {0, 0, 0, 0}
 };
 
-
-void  windup(param_pointer p) 
+static void windup(param_pointer p)
 {
     if (p->haldata && *(p->haldata->errorcount)) {
-	fprintf(stderr,"%s: %d modbus errors\n",p->progname, *(p->haldata->errorcount));
-	fprintf(stderr,"%s: last command register: 0x%.4x\n",p->progname, p->failed_reg);
-	fprintf(stderr,"%s: last error: %s\n",p->progname, modbus_strerror(p->last_errno));
+        fprintf(stderr, "%s: %d modbus errors\n",
+                p->progname, *(p->haldata->errorcount));
+        fprintf(stderr, "%s: last command register: 0x%.4x\n",
+                p->progname, p->failed_reg);
+        fprintf(stderr, "%s: last error: %s\n",
+                p->progname, modbus_strerror(p->last_errno));
     }
     if (p->hal_comp_id >= 0)
-	hal_exit(p->hal_comp_id);
+        hal_exit(p->hal_comp_id);
     if (p->ctx)
-	modbus_close(p->ctx);
+        modbus_close(p->ctx);
 }
 
 static void toggle_modbus_debug(int sig)
 {
+    (void)sig;
     param.modbus_debug = !param.modbus_debug;
     modbus_set_debug(param.ctx, param.modbus_debug);
 }
 
 static void toggle_debug(int sig)
 {
+    (void)sig;
     param.debug = !param.debug;
 }
 
-static void quit(int sig) 
+static void quit(int sig)
 {
+    (void)sig;
     if (param.debug)
-	fprintf(stderr,"quit(connection_state=%d)\n",connection_state);
+        fprintf(stderr, "quit(connection_state=%d)\n", connection_state);
 
     switch (connection_state) {
-
-    case CONNECTING:  
-	// modbus_tcp_accept() or TCP modbus_connect()  were interrupted
-	// these wont return to the main loop, so exit here
-	windup(&param);
-	exit(0);
-	break;
-
+    case CONNECTING:
+        /* modbus_connect() was interrupted — won't return to main loop */
+        windup(&param);
+        exit(0);
+        break;
     default:
-	connection_state = DONE;
-	break;
+        connection_state = DONE;
+        break;
     }
 }
 
-enum kwdresult {NAME_NOT_FOUND, KEYWORD_INVALID, KEYWORD_FOUND};
+/* ------------------------------------------------------------------ */
+/* INI file parsing                                                    */
+/* ------------------------------------------------------------------ */
+
+enum kwdresult { NAME_NOT_FOUND, KEYWORD_INVALID, KEYWORD_FOUND };
 #define MAX_KWD 10
 
-int findkwd(param_pointer p, const char *name, int *result, const char *keyword, int value, ...)
+static int findkwd(param_pointer p, const char *name, int *result,
+                   const char *keyword, int value, ...)
 {
     const char *word;
     va_list ap;
@@ -280,119 +242,137 @@ int findkwd(param_pointer p, const char *name, int *result, const char *keyword,
     int nargs = 0;
 
     if ((word = iniFind(p->fp, name, p->section)) == NULL)
-	return NAME_NOT_FOUND;
+        return NAME_NOT_FOUND;
 
     kwds[nargs++] = keyword;
     va_start(ap, value);
 
     while (keyword != NULL) {
-	if (!strcasecmp(word, keyword)) {
-	    *result = value;
-	    va_end(ap);
-	    return KEYWORD_FOUND;
-	}
-	keyword = va_arg(ap, const char *);
-	kwds[nargs++] = keyword;
-	if (keyword)
-	    value = va_arg(ap, int);
-    }  
-    fprintf(stderr, "%s: %s:[%s]%s: found '%s' - not one of: ", 
-	    p->progname, p->inifile, p->section, name, word);
-    for (s = kwds; *s; s++) 
-	fprintf(stderr, "%s ", *s);
+        if (!strcasecmp(word, keyword)) {
+            *result = value;
+            va_end(ap);
+            return KEYWORD_FOUND;
+        }
+        keyword = va_arg(ap, const char *);
+        kwds[nargs++] = keyword;
+        if (keyword)
+            value = va_arg(ap, int);
+    }
+
+    fprintf(stderr, "%s: %s:[%s]%s: found '%s' - not one of: ",
+            p->progname, p->inifile, p->section, name, word);
+    for (s = kwds; *s; s++)
+        fprintf(stderr, "%s ", *s);
     fprintf(stderr, "\n");
     va_end(ap);
     return KEYWORD_INVALID;
 }
 
-int read_ini(param_pointer p)
+static int read_ini(param_pointer p)
 {
     const char *s;
     double f;
     int value;
 
-    if ((p->fp = fopen(p->inifile,"r")) != NULL) {
-	if (!p->debug)
-	    iniFindInt(p->fp, "DEBUG", p->section, &p->debug);
-	if (!p->modbus_debug)
-	    iniFindInt(p->fp, "MODBUS_DEBUG", p->section, &p->modbus_debug);
-	iniFindInt(p->fp, "BITS", p->section, &p->bits);
-	iniFindInt(p->fp, "BAUD", p->section, &p->baud);
-	iniFindInt(p->fp, "STOPBITS", p->section, &p->stopbits);
-	iniFindInt(p->fp, "TARGET", p->section, &p->slave);
-	iniFindInt(p->fp, "POLLCYCLES", p->section, &p->pollcycles);
-	iniFindInt(p->fp, "RECONNECT_DELAY", p->section, &p->reconnect_delay);
+    if ((p->fp = fopen(p->inifile, "r")) == NULL) {
+        fprintf(stderr, "%s: can't open INI file '%s'\n",
+                p->progname, p->inifile);
+        return -1;
+    }
 
-	if ((s = iniFind(p->fp, "DEVICE", p->section))) {
-	    p->device = strdup(s);
-	}
-	if (iniFindDouble(p->fp, "RESPONSE_TIMEOUT", p->section, &f)) {
-	    p->response_timeout.tv_sec = (int) f;
-	    p->response_timeout.tv_usec = (f-p->response_timeout.tv_sec) * 1000000;
-	}
-	if (iniFindDouble(p->fp, "BYTE_TIMEOUT", p->section, &f)) {
-	    p->byte_timeout.tv_sec = (int) f;
-	    p->byte_timeout.tv_usec = (f-p->byte_timeout.tv_sec) * 1000000;
-	}
-	value = p->parity;
-	if (findkwd(p, "PARITY", &value,
-		    "even",'E', 
-		    "odd", 'O', 
-		    "none", 'N',
-		    NULL) == KEYWORD_INVALID)
-	    return -1;
-	p->parity = value;
+    if (!p->debug)
+        iniFindInt(p->fp, "DEBUG", p->section, &p->debug);
+    if (!p->modbus_debug)
+        iniFindInt(p->fp, "MODBUS_DEBUG", p->section, &p->modbus_debug);
 
-#ifdef MODBUS_RTU_RTS_UP	
-	if (findkwd(p, "RTS_MODE", &p->rts_mode,
-		    "up", MODBUS_RTU_RTS_UP,
-		    "down", MODBUS_RTU_RTS_DOWN, 
-		    "none", MODBUS_RTU_RTS_NONE,
-		    NULL) == KEYWORD_INVALID)
-	    return -1;
+    iniFindInt(p->fp, "BITS", p->section, &p->bits);
+    iniFindInt(p->fp, "BAUD", p->section, &p->baud);
+    iniFindInt(p->fp, "STOPBITS", p->section, &p->stopbits);
+    iniFindInt(p->fp, "TARGET", p->section, &p->slave);
+    iniFindInt(p->fp, "POLLCYCLES", p->section, &p->pollcycles);
+    iniFindInt(p->fp, "RECONNECT_DELAY", p->section, &p->reconnect_delay);
+
+    if ((s = iniFind(p->fp, "DEVICE", p->section)))
+        p->device = strdup(s);
+
+    if (iniFindDouble(p->fp, "RESPONSE_TIMEOUT", p->section, &f)) {
+        p->response_timeout.tv_sec = (int)f;
+        p->response_timeout.tv_usec = (f - p->response_timeout.tv_sec) * 1000000;
+    }
+    if (iniFindDouble(p->fp, "BYTE_TIMEOUT", p->section, &f)) {
+        p->byte_timeout.tv_sec = (int)f;
+        p->byte_timeout.tv_usec = (f - p->byte_timeout.tv_sec) * 1000000;
+    }
+
+    value = p->parity;
+    if (findkwd(p, "PARITY", &value,
+                "even", 'E',
+                "odd",  'O',
+                "none", 'N',
+                NULL) == KEYWORD_INVALID)
+        return -1;
+    p->parity = value;
+
+#ifdef MODBUS_RTU_RTS_UP
+    if (findkwd(p, "RTS_MODE", &p->rts_mode,
+                "up",   MODBUS_RTU_RTS_UP,
+                "down", MODBUS_RTU_RTS_DOWN,
+                "none", MODBUS_RTU_RTS_NONE,
+                NULL) == KEYWORD_INVALID)
+        return -1;
 #else
-	if (iniFind(p->fp, "RTS_MODE", p->section) != NULL) {
-	    fprintf(stderr,"%s: warning - the RTS_MODE feature is not available with the installed libmodbus version (%s).\n"
-		    "to enable it, uninstall libmodbus-dev and rebuild with "
-		    "libmodbus built http://github.com/stephane/libmodbus:master .\n", 
-		    LIBMODBUS_VERSION_STRING, p->progname);
-	}
+    if (iniFind(p->fp, "RTS_MODE", p->section) != NULL) {
+        fprintf(stderr, "%s: warning - RTS_MODE requires libmodbus >= 3.1 "
+                "(installed: %s)\n",
+                p->progname, LIBMODBUS_VERSION_STRING);
+    }
 #endif
 
-    } else {
-	fprintf(stderr, "%s:cant open inifile '%s'\n", 
-		p->progname, p->inifile);
-	return -1;
-    }
     return 0;
 }
 
-void usage(int argc, char **argv) {
-    printf("Usage:  %s [options]\n", argv[0]);
-    printf("This is a userspace HAL program, typically loaded using the halcmd \"loadusr\" command:\n"
-	   "    loadusr cmdrsk_vfd [options]\n"
-	   "Options are:\n"
-	   "-I or --ini <inifile>\n"
-	   "    Use <inifile> (default: take ini filename from environment variable INI_FILE_NAME)\n"
-	   "-S or --section <section-name> (default 8)\n"
-	   "    Read parameters from <section_name> (default 'CMDRSK')\n"
-	   "-d or --debug\n"
-	   "    Turn on debugging messages. Toggled by USR1 signal.\n"
-	   "-m or --modbus-debug\n"
-	   "    Turn on modbus debugging.  This will cause all modbus messages\n"
-	   "    to be printed in hex on the terminal. Toggled by USR2 signal.\n"	   
-	   "-r or --report-device\n"
-	   "    Report device properties on console at startup\n");
+static void usage(int argc, char **argv)
+{
+    (void)argc;
+    printf("Usage:  %s [options]\n"
+           "  Userspace HAL component for Commander SK VFD (RS-485 Modbus RTU)\n"
+           "  Typically loaded via: loadusr cmdrsk_vfd [options]\n"
+           "\n"
+           "Options:\n"
+           "  -I, --ini <inifile>      INI file (default: $INI_FILE_NAME)\n"
+           "  -S, --section <name>     INI section (default: CMDRSK)\n"
+           "  -n, --name <name>        HAL component name (default: cmdrsk_vfd)\n"
+           "  -d, --debug              Enable debug output (toggle: USR1)\n"
+           "  -m, --modbus-debug       Enable Modbus frame dumps (toggle: USR2)\n"
+           "  -r, --report-device      Report VFD version info at startup\n"
+           "  -h, --help               Show this help\n",
+           argv[0]);
 }
 
-#define SETPARAM(param,from)					\
-    do {							\
-	curr_param = param - 1;					\
-	if (modbus_write_register(ctx, param - 1, from) < 0)	\
-	    goto failed;					\
+/* ------------------------------------------------------------------ */
+/* Modbus register access macros                                       */
+/* ------------------------------------------------------------------ */
+
+/* CT Modbus addressing: wire-level register = param - 1 */
+#define SETPARAM(param, from)                                       \
+    do {                                                            \
+        curr_param = param - 1;                                     \
+        if (modbus_write_register(ctx, param - 1, from) < 0)        \
+            goto failed;                                            \
     } while (0)
-        
-int write_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
+
+#define GETPARAM(param, into)                                       \
+    do {                                                            \
+        curr_param = param - 1;                                     \
+        if (modbus_read_registers(ctx, param - 1, 1, into) != 1)    \
+            goto failed;                                            \
+    } while (0)
+
+/* ------------------------------------------------------------------ */
+/* Modbus write — speed reference, control word, fault reset           */
+/* ------------------------------------------------------------------ */
+
+static int write_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
 {
     static hal_float_t last_freq_cmd = -1.0;
     static uint16_t last_control_reg = 0xFFFF;
@@ -400,43 +380,42 @@ int write_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
     int freq_reg;
     uint16_t control_reg, curr_param;
 
-    /* --- Fault reset (rising edge of fault-reset pin) ---
-     * The correct serial reset method per Commander SK Advanced User Guide
-     * section 4.1, method 4: write 100 to Pr 10.38 (PR_USER_TRIP).
-     * This is preferable to control-word bit 13 because it works even when
-     * the control word enable (Pr 6.43) is not active. */
+    /*
+     * Fault reset — rising edge of fault-reset pin.
+     * Writes 100 to Pr 10.38 per Commander SK manual section 4.1, method 4.
+     */
     if (*(haldata->fault_reset) && !p->old_fault_reset) {
-        DBG("write_data: fault-reset rising edge - sending drive reset (Pr 10.38 = 100)\n");
+        DBG("write_data: fault-reset rising edge — sending drive reset\n");
         SETPARAM(PR_USER_TRIP, 100);
-        /* Force re-send of freq and control word on next cycle */
         last_freq_cmd = -1.0;
         last_control_reg = 0xFFFF;
     }
     p->old_fault_reset = *(haldata->fault_reset);
 
-    /* --- Speed reference --- */
-    *(haldata->freq_cmd) = (*(haldata->speed_command) * *(haldata->upper_limit_hz)) / *(haldata->max_rpm);
+    /* Speed reference */
+    *(haldata->freq_cmd) = (*(haldata->speed_command) *
+                            *(haldata->upper_limit_hz)) / *(haldata->max_rpm);
 
     if (*(haldata->freq_cmd) != last_freq_cmd) {
-        /* Set coarse precision reference (Pr 1.18, units = 0.1 Hz) */
         freq_reg = (int)fabs(*(haldata->freq_cmd) * 10.0);
         SETPARAM(PR_PRECISION_REF_COARSE, freq_reg);
         usleep(10000);
-        /* Select precision reference as the active speed source (Pr 1.14 = 5) */
         SETPARAM(PR_REFERENCE_SELECTOR, SEL_REFERENCE_PRECISION);
         usleep(10000);
-        DBG("write_data: freq_cmd=%f, freq_reg=%d\n", *(haldata->freq_cmd), freq_reg);
+        DBG("write_data: freq_cmd=%f, freq_reg=%d\n",
+            *(haldata->freq_cmd), freq_reg);
     }
     last_freq_cmd = *(haldata->freq_cmd);
 
-    /* --- Control word --- */
+    /* Control word */
     control_reg = CTL_DRIVE_ENABLE | CTL_AUTO_MANUAL;
-    if (*(haldata->spindle_on) && *(haldata->spindle_fwd) && !*(haldata->spindle_rev)) {
+    if (*(haldata->spindle_on) && *(haldata->spindle_fwd) &&
+        !*(haldata->spindle_rev)) {
         control_reg |= CTL_N_STOP | CTL_RUN_FORWARD;
-    } else if (*(haldata->spindle_on) && *(haldata->spindle_rev) && !*(haldata->spindle_fwd)) {
+    } else if (*(haldata->spindle_on) && *(haldata->spindle_rev) &&
+               !*(haldata->spindle_fwd)) {
         control_reg |= CTL_N_STOP | CTL_RUN_REVERSE;
     } else {
-        /* Stopped or invalid direction combination */
         control_reg &= ~CTL_N_STOP;
     }
 
@@ -451,22 +430,18 @@ int write_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
 
     return 0;
 
-  failed:
+failed:
     p->failed_reg = curr_param;
     (*haldata->errorcount)++;
     p->last_errno = errno;
     return errno;
 }
 
-#define GETPARAM(param,into)					\
-    do {							\
-	curr_param = param - 1;					\
-	if (modbus_read_registers(ctx, param - 1, 1, into) != 1)	\
-	    goto failed;					\
-    } while (0)
+/* ------------------------------------------------------------------ */
+/* Modbus read — status word, frequency, slow registers                */
+/* ------------------------------------------------------------------ */
 
-    
-int read_initial(modbus_t *ctx, haldata_t *haldata, param_pointer p)
+static int read_initial(modbus_t *ctx, haldata_t *haldata, param_pointer p)
 {
     uint16_t curr_param;
     uint16_t sw_version, sw_subversion, dsp_version;
@@ -475,54 +450,49 @@ int read_initial(modbus_t *ctx, haldata_t *haldata, param_pointer p)
 
     GETPARAM(PR_MAX_SET_SPEED, &max_freq);
     GETPARAM(PR_MIN_SET_SPEED, &min_freq);
-
     GETPARAM(PR_RATED_FREQUENCY, &rated_freq);
     GETPARAM(PR_RATED_RPM, &rated_rpm);
 
-    haldata->motor_rated_hz = rated_freq / 10.0;
+    haldata->motor_rated_hz  = rated_freq / 10.0;
     haldata->motor_rated_rpm = rated_rpm / 1.0;
-    
-    *(haldata->upper_limit_hz) = max_freq/10.0;
-    *(haldata->max_rpm) = *(haldata->upper_limit_hz) * haldata->motor_rated_rpm / haldata->motor_rated_hz;
 
-    *(haldata->lower_limit_hz) = min_freq/10.0;
-    *(haldata->min_rpm) = *(haldata->lower_limit_hz) * haldata->motor_rated_rpm / haldata->motor_rated_hz;
-    
+    *(haldata->upper_limit_hz) = max_freq / 10.0;
+    *(haldata->max_rpm) = *(haldata->upper_limit_hz) *
+                          haldata->motor_rated_rpm / haldata->motor_rated_hz;
+
+    *(haldata->lower_limit_hz) = min_freq / 10.0;
+    *(haldata->min_rpm) = *(haldata->lower_limit_hz) *
+                          haldata->motor_rated_rpm / haldata->motor_rated_hz;
+
     if (p->report_device) {
         GETPARAM(PR_SW_VERSION, &sw_version);
         GETPARAM(PR_SW_SUBVERSION, &sw_subversion);
         GETPARAM(PR_DSP_VERSION, &dsp_version);
-
-	printf("%s: sw version: %d/0x%4.4x\n", 
-	       p->progname, sw_version, sw_version);
-	printf("%s: sw sub-version: %d/0x%4.4x\n", 
-	       p->progname, sw_subversion, sw_subversion);
-	printf("%s: dsp version: %d/0x%4.4x\n", 
-	       p->progname, dsp_version, dsp_version);
+        fprintf(stderr, "%s: sw=%d.%d  dsp=%d\n",
+                p->progname, sw_version, sw_subversion, dsp_version);
     }
     return 0;
 
- failed:
+failed:
     p->failed_reg = curr_param;
     p->last_errno = errno;
     (*haldata->errorcount)++;
     if (p->debug)
-	fprintf(stderr, "%s: read_initial: modbus_read_registers(0x%4.4x): %s\n", 
-		p->progname, curr_param, modbus_strerror(errno));
+        fprintf(stderr, "%s: read_initial: modbus_read_registers(0x%4.4x): %s\n",
+                p->progname, curr_param, modbus_strerror(errno));
     return p->last_errno;
 }
 
-int read_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
+static int read_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
 {
     int retval;
     uint16_t curr_param, val, status_word, freq;
     static int pollcount = 0;
 
     if (!p->read_initial_done) {
-	if ((retval = read_initial(ctx, haldata, p)))
-	    return retval;
-	else
-	    p->read_initial_done = 1;
+        if ((retval = read_initial(ctx, haldata, p)))
+            return retval;
+        p->read_initial_done = 1;
     }
 
     GETPARAM(PR_STATUS_WORD, &status_word);
@@ -532,22 +502,20 @@ int read_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
     *(haldata->freq_out) = freq / 10.0;
 
     /* Decode status word bits */
-    *(haldata->drive_ok)     = (status_word & ST_DRIVE_OK)     ? 1 : 0;
-    *(haldata->drive_active) = (status_word & ST_DRIVE_ACTIVE) ? 1 : 0;
-    *(haldata->is_stopped)   = (status_word & ST_ZERO_SPEED)   ? 1 : 0;
-    *(haldata->at_speed)     = (status_word & ST_AT_SET_SPEED)  ? 1 : 0;
-    *(haldata->spindle_running_rev) = (status_word & ST_DIRECTION_RUNNING) ? 1 : 0;
-
-    /* Fault pin is the inverse of drive-ok */
+    *(haldata->drive_ok)           = (status_word & ST_DRIVE_OK)         ? 1 : 0;
+    *(haldata->drive_active)       = (status_word & ST_DRIVE_ACTIVE)     ? 1 : 0;
+    *(haldata->is_stopped)         = (status_word & ST_ZERO_SPEED)       ? 1 : 0;
+    *(haldata->at_speed)           = (status_word & ST_AT_SET_SPEED)     ? 1 : 0;
+    *(haldata->spindle_running_rev)= (status_word & ST_DIRECTION_RUNNING)? 1 : 0;
     *(haldata->fault) = *(haldata->drive_ok) ? 0 : 1;
 
-    /* Check for drive trip and log trip codes */
+    /* Trip detection and logging */
     if (!(status_word & ST_DRIVE_OK)) {
         uint16_t trip_codes[10];
         int i;
-        for (i = 0; i < 10; i++) {
+        for (i = 0; i < 10; i++)
             GETPARAM(PR_LAST_TRIP + i, &trip_codes[i]);
-        }
+
         *(haldata->alarm_code) = trip_codes[0];
         if (p->debug || trip_codes[0] != *(haldata->trip_code)) {
             fprintf(stderr, "%s: FAULT trip=%s (%s)\n",
@@ -558,7 +526,7 @@ int read_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
         *(haldata->trip_code) = trip_codes[0];
     }
 
-    /* Slow registers - only every pollcycles, and not in max-speed mode */
+    /* Slow registers — every Nth cycle, not in max-speed mode */
     if ((pollcount == 0) && !(*haldata->max_speed)) {
         GETPARAM(PR_PERCENT_LOAD, &val);
         *(haldata->load_current_pct) = val / 10.0;
@@ -566,18 +534,13 @@ int read_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
         GETPARAM(PR_MOTOR_SPEED, &val);
         *(haldata->RPM) = val * 1.0;
 
-        /* Hardware enable terminal (Pr 6.29) - reflects physical interlock state.
-         * Goes low during power drawbar use - this is normal and expected. */
         GETPARAM(PR_HARDWARE_ENABLE, &val);
         *(haldata->hardware_enable) = val ? 1 : 0;
 
-        /* Software drive enable (Pr 6.15) */
         GETPARAM(PR_DRIVE_ENABLE, &val);
         *(haldata->drive_enable) = val ? 1 : 0;
     }
 
-    /* Always advance pollcount - fixes bug where slow registers were
-     * read on every cycle because the else branch never ran at pollcount==0 */
     pollcount++;
     if (pollcount >= p->pollcycles)
         pollcount = 0;
@@ -585,371 +548,359 @@ int read_data(modbus_t *ctx, haldata_t *haldata, param_pointer p)
     p->last_errno = retval = 0;
     return 0;
 
- failed:
+failed:
     p->failed_reg = curr_param;
     p->last_errno = errno;
     (*haldata->errorcount)++;
     if (p->debug)
-	fprintf(stderr, "%s: read_data: modbus_read_registers(0x%4.4x): %s\n",
-		p->progname, curr_param, modbus_strerror(errno));
+        fprintf(stderr, "%s: read_data: modbus_read_registers(0x%4.4x): %s\n",
+                p->progname, curr_param, modbus_strerror(errno));
     return p->last_errno;
 }
 
-#undef GETREG
+/* ------------------------------------------------------------------ */
+/* HAL pin registration                                                */
+/* ------------------------------------------------------------------ */
 
-#define PIN(x)					\
-    do {						\
-	status = (x);					\
-	if ((status) != 0)				\
-	    return status;				\
+#define PIN(x)                          \
+    do {                                \
+        status = (x);                   \
+        if (status != 0) return status; \
     } while (0)
 
-int hal_setup(int id, haldata_t *h, const char *name)
+static int hal_setup(int id, haldata_t *h, const char *name)
 {
     int status;
-    PIN(hal_pin_s32_newf(HAL_OUT, &(h->alarm_code), id, "%s.alarm-code", name));
-    PIN(hal_pin_bit_newf(HAL_OUT, &(h->at_speed), id, "%s.at-speed", name));
-    PIN(hal_pin_float_newf(HAL_OUT, &(h->load_current_pct), id, "%s.current-load-percentage", name));
-    PIN(hal_pin_float_newf(HAL_OUT, &(h->freq_cmd), id, "%s.frequency-command", name));
-    PIN(hal_pin_float_newf(HAL_OUT, &(h->freq_out), id, "%s.frequency-out", name));
-    PIN(hal_pin_float_newf(HAL_OUT, &(h->inv_load_pct), id, "%s.inverter-load-percentage", name));
-    PIN(hal_pin_bit_newf(HAL_OUT, &(h->is_stopped), id, "%s.is-stopped", name));
-    PIN(hal_pin_float_newf(HAL_OUT, &(h->max_rpm), id, "%s.max-rpm", name));
-    PIN(hal_pin_float_newf(HAL_OUT, &(h->min_rpm), id, "%s.min-rpm", name));
-    PIN(hal_pin_bit_newf(HAL_OUT, &(h->modbus_ok), id, "%s.modbus-ok", name));
-    PIN(hal_pin_float_newf(HAL_OUT, &(h->RPM), id, "%s.motor-RPM", name));
-    PIN(hal_pin_float_newf(HAL_IN,  &(h->speed_command), id, "%s.speed-command", name));
-    PIN(hal_pin_bit_newf(HAL_IN,  &(h->spindle_fwd), id, "%s.spindle-fwd", name));
-    PIN(hal_pin_bit_newf(HAL_IN,  &(h->spindle_on), id, "%s.spindle-on", name));
-    PIN(hal_pin_bit_newf(HAL_IN,  &(h->spindle_rev), id, "%s.spindle-rev", name));
-    PIN(hal_pin_s32_newf(HAL_OUT, &(h->status), id, "%s.status", name));
-    PIN(hal_pin_s32_newf(HAL_OUT, &(h->trip_code), id, "%s.trip-code", name));
-    PIN(hal_pin_bit_newf(HAL_IN,  &(h->max_speed), id, "%s.max-speed", name));
-    PIN(hal_pin_s32_newf(HAL_OUT, &(h->errorcount), id, "%s.error-count", name));
-    PIN(hal_pin_float_newf(HAL_OUT, &(h->upper_limit_hz), id, "%s.frequency-limit-high", name));
-    PIN(hal_pin_float_newf(HAL_OUT, &(h->lower_limit_hz), id, "%s.frequency-limit-low", name));
-    /* new pins */
-    PIN(hal_pin_bit_newf(HAL_IN,  &(h->enabled), id, "%s.enabled", name));
-    PIN(hal_pin_bit_newf(HAL_OUT, &(h->fault), id, "%s.fault", name));
-    PIN(hal_pin_bit_newf(HAL_IN,  &(h->fault_reset), id, "%s.fault-reset", name));
-    PIN(hal_pin_bit_newf(HAL_OUT, &(h->drive_ok), id, "%s.drive-ok", name));
-    PIN(hal_pin_bit_newf(HAL_OUT, &(h->drive_active), id, "%s.drive-active", name));
-    PIN(hal_pin_bit_newf(HAL_OUT, &(h->spindle_running_rev), id, "%s.spindle-running-rev", name));
-    PIN(hal_pin_bit_newf(HAL_OUT, &(h->hardware_enable), id, "%s.hardware-enable", name));
-    PIN(hal_pin_bit_newf(HAL_OUT, &(h->drive_enable), id, "%s.drive-enable", name));
 
-    PIN(hal_param_float_newf(HAL_RW, &(h->looptime), id, "%s.loop-time", name));
-    PIN(hal_param_float_newf(HAL_RW, &(h->motor_rated_hz), id, "%s.rated-hz", name));
+    /* Output pins */
+    PIN(hal_pin_s32_newf(HAL_OUT,  &(h->alarm_code),        id, "%s.alarm-code", name));
+    PIN(hal_pin_bit_newf(HAL_OUT,  &(h->at_speed),          id, "%s.at-speed", name));
+    PIN(hal_pin_float_newf(HAL_OUT,&(h->load_current_pct),  id, "%s.current-load-percentage", name));
+    PIN(hal_pin_float_newf(HAL_OUT,&(h->freq_cmd),          id, "%s.frequency-command", name));
+    PIN(hal_pin_float_newf(HAL_OUT,&(h->freq_out),          id, "%s.frequency-out", name));
+    PIN(hal_pin_float_newf(HAL_OUT,&(h->inv_load_pct),      id, "%s.inverter-load-percentage", name));
+    PIN(hal_pin_bit_newf(HAL_OUT,  &(h->is_stopped),        id, "%s.is-stopped", name));
+    PIN(hal_pin_float_newf(HAL_OUT,&(h->max_rpm),           id, "%s.max-rpm", name));
+    PIN(hal_pin_float_newf(HAL_OUT,&(h->min_rpm),           id, "%s.min-rpm", name));
+    PIN(hal_pin_bit_newf(HAL_OUT,  &(h->modbus_ok),         id, "%s.modbus-ok", name));
+    PIN(hal_pin_float_newf(HAL_OUT,&(h->RPM),               id, "%s.motor-RPM", name));
+    PIN(hal_pin_s32_newf(HAL_OUT,  &(h->status),            id, "%s.status", name));
+    PIN(hal_pin_s32_newf(HAL_OUT,  &(h->trip_code),         id, "%s.trip-code", name));
+    PIN(hal_pin_s32_newf(HAL_OUT,  &(h->errorcount),        id, "%s.error-count", name));
+    PIN(hal_pin_float_newf(HAL_OUT,&(h->upper_limit_hz),    id, "%s.frequency-limit-high", name));
+    PIN(hal_pin_float_newf(HAL_OUT,&(h->lower_limit_hz),    id, "%s.frequency-limit-low", name));
+    PIN(hal_pin_bit_newf(HAL_OUT,  &(h->fault),             id, "%s.fault", name));
+    PIN(hal_pin_bit_newf(HAL_OUT,  &(h->drive_ok),          id, "%s.drive-ok", name));
+    PIN(hal_pin_bit_newf(HAL_OUT,  &(h->drive_active),      id, "%s.drive-active", name));
+    PIN(hal_pin_bit_newf(HAL_OUT,  &(h->spindle_running_rev),id,"%s.spindle-running-rev", name));
+    PIN(hal_pin_bit_newf(HAL_OUT,  &(h->hardware_enable),   id, "%s.hardware-enable", name));
+    PIN(hal_pin_bit_newf(HAL_OUT,  &(h->drive_enable),      id, "%s.drive-enable", name));
+
+    /* Input pins */
+    PIN(hal_pin_float_newf(HAL_IN, &(h->speed_command),     id, "%s.speed-command", name));
+    PIN(hal_pin_bit_newf(HAL_IN,   &(h->spindle_fwd),       id, "%s.spindle-fwd", name));
+    PIN(hal_pin_bit_newf(HAL_IN,   &(h->spindle_on),        id, "%s.spindle-on", name));
+    PIN(hal_pin_bit_newf(HAL_IN,   &(h->spindle_rev),       id, "%s.spindle-rev", name));
+    PIN(hal_pin_bit_newf(HAL_IN,   &(h->enabled),           id, "%s.enabled", name));
+    PIN(hal_pin_bit_newf(HAL_IN,   &(h->fault_reset),       id, "%s.fault-reset", name));
+    PIN(hal_pin_bit_newf(HAL_IN,   &(h->max_speed),         id, "%s.max-speed", name));
+
+    /* HAL parameters */
+    PIN(hal_param_float_newf(HAL_RW, &(h->looptime),        id, "%s.loop-time", name));
+    PIN(hal_param_float_newf(HAL_RW, &(h->motor_rated_hz),  id, "%s.rated-hz", name));
     PIN(hal_param_float_newf(HAL_RW, &(h->motor_rated_rpm), id, "%s.rated-rpm", name));
-    PIN(hal_param_float_newf(HAL_RW, &(h->rpm_limit), id, "%s.rpm-limit", name));
+    PIN(hal_param_float_newf(HAL_RW, &(h->rpm_limit),       id, "%s.rpm-limit", name));
     PIN(hal_param_float_newf(HAL_RW, &(h->speed_tolerance), id, "%s.tolerance", name));
 
     return 0;
 }
 #undef PIN
 
-int set_defaults(param_pointer p)
+/* ------------------------------------------------------------------ */
+/* Pin initialisation                                                  */
+/* ------------------------------------------------------------------ */
+
+static int set_defaults(param_pointer p)
 {
     haldata_t *h = p->haldata;
 
-    *(h->status) = 0;
-    *(h->freq_cmd) = 0;
-    *(h->freq_out) = 0;
-    *(h->RPM) = 0;
-    *(h->inv_load_pct) = 0;
-    *(h->load_current_pct) = 0;
-    *(h->upper_limit_hz) = 0;
-    *(h->lower_limit_hz) = 0;
-    *(h->trip_code) = 0;
-    *(h->alarm_code) = 0;
-    *(h->at_speed) = 0;
-    *(h->is_stopped) = 0;
-    *(h->speed_command) = 0;
-    *(h->modbus_ok) = 0;
-    *(h->spindle_on) = 0;
-    *(h->spindle_fwd) = 1;
-    *(h->spindle_rev) = 0;
-    *(h->errorcount) = 0;
-    *(h->max_speed) = 0;
-    /* new pins */
-    *(h->enabled) = 0;
-    *(h->fault) = 0;
-    *(h->fault_reset) = 0;
-    *(h->drive_ok) = 0;
-    *(h->drive_active) = 0;
-    *(h->spindle_running_rev) = 0;
-    *(h->hardware_enable) = 0;
-    *(h->drive_enable) = 0;
+    /* Output pins */
+    *(h->status)            = 0;
+    *(h->freq_cmd)          = 0;
+    *(h->freq_out)          = 0;
+    *(h->RPM)               = 0;
+    *(h->inv_load_pct)      = 0;
+    *(h->load_current_pct)  = 0;
+    *(h->upper_limit_hz)    = 0;
+    *(h->lower_limit_hz)    = 0;
+    *(h->trip_code)         = 0;
+    *(h->alarm_code)        = 0;
+    *(h->at_speed)          = 0;
+    *(h->is_stopped)        = 0;
+    *(h->modbus_ok)         = 0;
+    *(h->errorcount)        = 0;
+    *(h->fault)             = 0;
+    *(h->drive_ok)          = 0;
+    *(h->drive_active)      = 0;
+    *(h->spindle_running_rev)= 0;
+    *(h->hardware_enable)   = 0;
+    *(h->drive_enable)      = 0;
 
-    h->looptime = 0.010;
-    h->speed_tolerance = 0.01;
-    h->rpm_limit = MAX_RPM;
+    /* Input pins */
+    *(h->speed_command)     = 0;
+    *(h->spindle_on)        = 0;
+    *(h->spindle_fwd)       = 1;
+    *(h->spindle_rev)       = 0;
+    *(h->enabled)           = 0;
+    *(h->fault_reset)       = 0;
+    *(h->max_speed)         = 0;
+
+    /* HAL parameters */
+    h->looptime         = 0.010;
+    h->speed_tolerance  = 0.01;
+    h->rpm_limit        = MAX_RPM;
 
     p->failed_reg = 0;
     return 0;
 }
 
-/* Zero all output pins — called when enabled goes false (VFD unpowered).
- * Does not touch input pins or HAL parameters. */
+/* Zero all output pins — called when enabled goes false (VFD unpowered). */
 static void zero_outputs(haldata_t *h)
 {
-    *(h->status) = 0;
-    *(h->freq_cmd) = 0;
-    *(h->freq_out) = 0;
-    *(h->RPM) = 0;
-    *(h->inv_load_pct) = 0;
-    *(h->load_current_pct) = 0;
-    *(h->upper_limit_hz) = 0;
-    *(h->lower_limit_hz) = 0;
-    *(h->trip_code) = 0;
-    *(h->alarm_code) = 0;
-    *(h->at_speed) = 0;
-    *(h->is_stopped) = 0;
-    *(h->modbus_ok) = 0;
-    *(h->fault) = 0;
-    *(h->drive_ok) = 0;
-    *(h->drive_active) = 0;
-    *(h->spindle_running_rev) = 0;
-    *(h->hardware_enable) = 0;
-    *(h->drive_enable) = 0;
+    *(h->status)            = 0;
+    *(h->freq_cmd)          = 0;
+    *(h->freq_out)          = 0;
+    *(h->RPM)               = 0;
+    *(h->inv_load_pct)      = 0;
+    *(h->load_current_pct)  = 0;
+    *(h->upper_limit_hz)    = 0;
+    *(h->lower_limit_hz)    = 0;
+    *(h->trip_code)         = 0;
+    *(h->alarm_code)        = 0;
+    *(h->at_speed)          = 0;
+    *(h->is_stopped)        = 0;
+    *(h->modbus_ok)         = 0;
+    *(h->fault)             = 0;
+    *(h->drive_ok)          = 0;
+    *(h->drive_active)      = 0;
+    *(h->spindle_running_rev)= 0;
+    *(h->hardware_enable)   = 0;
+    *(h->drive_enable)      = 0;
 }
+/* ------------------------------------------------------------------ */
+/* Main                                                                */
+/* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv)
 {
     struct timespec loop_timespec, remaining;
     int opt;
     param_pointer p = &param;
-    int retval = 0;
-    retval = -1;
+    int retval = -1;
+
     p->progname = argv[0];
     connection_state = NOT_CONNECTED;
     p->inifile = getenv("INI_FILE_NAME");
 
-  
-    while ((opt = getopt_long(argc, argv, option_string, long_options, NULL)) != -1) {
-	switch(opt) {
-	case 'n':
-	    p->modname = strdup(optarg);
-	    break;
-	case 'm':
-	    p->modbus_debug = 1;
-	    break;
-	case 'd':   
-	    p->debug = 1;
-	    break;
-	case 'S':
-	    p->section = optarg;
-	    break;
-	case 'I':
-	    p->inifile = optarg;
-	    break;	
-	case 'r':
-	    p->report_device = 1;
-	    break;
-	case 'h':
-	default:
-	    usage(argc, argv);
-	exit(0);
-	}
+    while ((opt = getopt_long(argc, argv, option_string,
+                              long_options, NULL)) != -1) {
+        switch (opt) {
+        case 'n': p->modname       = strdup(optarg); break;
+        case 'm': p->modbus_debug  = 1;              break;
+        case 'd': p->debug         = 1;              break;
+        case 'S': p->section       = optarg;          break;
+        case 'I': p->inifile       = optarg;          break;
+        case 'r': p->report_device = 1;              break;
+        case 'h':
+        default:
+            usage(argc, argv);
+            exit(0);
+        }
     }
 
     if (p->inifile) {
-	if (read_ini(p))
-	    goto finish;
-	if (!p->modname)
-	    p->modname = "cmdrsk_vfd";
+        if (read_ini(p))
+            goto finish;
+        if (!p->modname)
+            p->modname = "cmdrsk_vfd";
     } else {
-	fprintf(stderr, "%s: ERROR: no inifile - either use '--ini inifile' or set INI_FILE_NAME environment variable\n", p->progname);
-	goto finish;
+        fprintf(stderr, "%s: ERROR: no INI file — use '--ini file' or "
+                "set INI_FILE_NAME\n", p->progname);
+        goto finish;
     }
 
-    
-    signal(SIGINT, quit);
+    signal(SIGINT,  quit);
     signal(SIGTERM, quit);
     signal(SIGUSR1, toggle_debug);
     signal(SIGUSR2, toggle_modbus_debug);
 
-    fprintf(stderr, "%s: creating HAL component\n", p->progname);
-
-    // create HAL component 
+    /* Create HAL component */
     p->hal_comp_id = hal_init(p->modname);
-    if ((p->hal_comp_id < 0) || (connection_state == DONE)) {
-	fprintf(stderr, "%s: ERROR: hal_init(%s) failed: HAL error code=%d\n", 
-		p->progname, p->modname, p->hal_comp_id);
-	retval = p->hal_comp_id;
-	goto finish;
+    if (p->hal_comp_id < 0 || connection_state == DONE) {
+        fprintf(stderr, "%s: ERROR: hal_init(%s) failed: %d\n",
+                p->progname, p->modname, p->hal_comp_id);
+        retval = p->hal_comp_id;
+        goto finish;
     }
 
-    fprintf(stderr, "%s: getting shared memory\n", p->progname);
-    
-    // grab some shmem to store the HAL data in
+    /* Allocate HAL shared memory */
     p->haldata = (haldata_t *)hal_malloc(sizeof(haldata_t));
-    if ((p->haldata == 0) || (connection_state == DONE)) {
-	fprintf(stderr, "%s: ERROR: unable to allocate shared memory\n", p->modname);
-	retval = -1;
-	goto finish;
+    if (p->haldata == NULL || connection_state == DONE) {
+        fprintf(stderr, "%s: ERROR: unable to allocate shared memory\n",
+                p->modname);
+        retval = -1;
+        goto finish;
     }
 
-    fprintf(stderr, "%s: doing hal_setup.  hal_comp_id=%d modname=%s\n", p->progname, p->hal_comp_id, p->modname);
+    if (hal_setup(p->hal_comp_id, p->haldata, p->modname))
+        goto finish;
 
-    int ret = hal_setup(p->hal_comp_id,p->haldata, p->modname);
-    fprintf(stderr, "%s: hal_setup returned %d\n", p->progname, ret);
-    if (ret)
-	goto finish;
-
-    fprintf(stderr, "%s: setting defaults\n", p->progname);
     set_defaults(p);
-    fprintf(stderr, "%s: doing hal_ready\n", p->progname);
     hal_ready(p->hal_comp_id);
+    DBG("%s: HAL ready, using libmodbus %s\n",
+        p->progname, LIBMODBUS_VERSION_STRING);
 
-    fprintf(stderr, "%s: HAL should be ready\n", p->progname);
-
-    DBG("using libmodbus version %s\n", LIBMODBUS_VERSION_STRING);
-	
+    /* Open serial port */
     connection_state = OPENING;
-    if ((p->ctx = modbus_new_rtu(p->device, p->baud, p->parity, p->bits, p->stopbits)) == NULL) {
-        fprintf(stderr, "%s: ERROR: modbus_new_rtu(%s): %s\n", 
+    p->ctx = modbus_new_rtu(p->device, p->baud, p->parity,
+                            p->bits, p->stopbits);
+    if (p->ctx == NULL) {
+        fprintf(stderr, "%s: ERROR: modbus_new_rtu(%s): %s\n",
                 p->progname, p->device, modbus_strerror(errno));
         goto finish;
     }
+
     if (modbus_set_slave(p->ctx, p->slave) < 0) {
-        fprintf(stderr, "%s: ERROR: invalid slave number: %d\n", p->modname, p->slave);
+        fprintf(stderr, "%s: ERROR: invalid slave number: %d\n",
+                p->modname, p->slave);
         goto finish;
     }
-    if ((retval = modbus_connect(p->ctx)) != 0) {
-        fprintf(stderr, "%s: ERROR: couldn't open serial device: %s\n", p->modname, modbus_strerror(errno));
+
+    if (modbus_connect(p->ctx) != 0) {
+        fprintf(stderr, "%s: ERROR: couldn't open serial device: %s\n",
+                p->modname, modbus_strerror(errno));
         goto finish;
     }
-    // see https://github.com/stephane/libmodbus/issues/42
-    if ((p->serial_mode != -1) && modbus_rtu_set_serial_mode(p->ctx, p->serial_mode) < 0) {
-        fprintf(stderr, "%s: ERROR: modbus_rtu_set_serial_mode(%d): %s\n", 
+
+    if (p->serial_mode != -1 &&
+        modbus_rtu_set_serial_mode(p->ctx, p->serial_mode) < 0) {
+        fprintf(stderr, "%s: ERROR: modbus_rtu_set_serial_mode(%d): %s\n",
                 p->modname, p->serial_mode, modbus_strerror(errno));
         goto finish;
     }
-#ifdef MODBUS_RTU_RTS_UP	
-    if ((p->rts_mode != -1) && modbus_rtu_set_rts(p->ctx, p->rts_mode) < 0) {
-        fprintf(stderr, "%s: ERROR: modbus_rtu_set_rts(%d): %s\n", 
+
+#ifdef MODBUS_RTU_RTS_UP
+    if (p->rts_mode != -1 &&
+        modbus_rtu_set_rts(p->ctx, p->rts_mode) < 0) {
+        fprintf(stderr, "%s: ERROR: modbus_rtu_set_rts(%d): %s\n",
                 p->modname, p->rts_mode, modbus_strerror(errno));
         goto finish;
     }
 #endif
-    DBG("%s: serial port %s connected\n", p->progname, p->device);
 
     modbus_set_debug(p->ctx, p->modbus_debug);
-    if (modbus_set_slave(p->ctx, p->slave) < 0) {
-	fprintf(stderr, "%s: ERROR: invalid slave number: %d\n", p->modname, p->slave);
-	goto finish;
-    }
+    DBG("%s: serial port %s connected\n", p->progname, p->device);
+
+    /* ---------------------------------------------------------- */
+    /* Main poll loop                                              */
+    /* ---------------------------------------------------------- */
 
     connection_state = CONNECTED;
     while (connection_state != DONE) {
 
-	while (connection_state == CONNECTED) {
-	    /* --- enabled-pin awareness ---
-	     * When the machine is off the VFD is unpowered.  Skip all Modbus
-	     * activity to avoid filling the error log with spurious timeouts.
-	     * Zero the output pins so stale values aren't visible in HAL. */
-	    if (!*(p->haldata->enabled)) {
-		if (p->was_enabled) {
-		    DBG("%s: enabled->false: suspending Modbus, zeroing outputs\n",
-			p->progname);
-		    zero_outputs(p->haldata);
-		    p->read_initial_done = 0; /* re-read VFD params on next enable */
-		    p->modbus_ok = 0;
-		}
-		p->was_enabled = 0;
-		/* Sleep at normal rate so we don't busy-spin */
-		if (p->haldata->looptime < 0.001) p->haldata->looptime = 0.001;
-		if (p->haldata->looptime > 2.0)   p->haldata->looptime = 2.0;
-		loop_timespec.tv_sec  = (time_t)(p->haldata->looptime);
-		loop_timespec.tv_nsec = (long)((p->haldata->looptime -
-					 loop_timespec.tv_sec) * 1000000000l);
-		nanosleep(&loop_timespec, &remaining);
-		continue;
-	    }
+        while (connection_state == CONNECTED) {
 
-	    /* Transitioning disabled -> enabled */
-	    if (!p->was_enabled) {
-		DBG("%s: enabled->true: resuming Modbus\n", p->progname);
-		p->was_enabled = 1;
-		p->read_initial_done = 0;
-	    }
+            /* Enabled-pin awareness: when the VFD is unpowered, skip
+             * all Modbus traffic and zero output pins. */
+            if (!*(p->haldata->enabled)) {
+                if (p->was_enabled) {
+                    DBG("%s: enabled->false: suspending Modbus\n",
+                        p->progname);
+                    zero_outputs(p->haldata);
+                    p->read_initial_done = 0;
+                    p->modbus_ok = 0;
+                }
+                p->was_enabled = 0;
 
-	    if ((retval = read_data(p->ctx, p->haldata, p))) {
-		p->modbus_ok = 0;
-	    } else {
-		p->modbus_ok++;
-	    }
-	    if (p->modbus_ok > MODBUS_MIN_OK) {
-		*(p->haldata->modbus_ok) = 1;
-	    } else {
-		*(p->haldata->modbus_ok) = 0;
-	    }
-	    if ((retval = write_data(p->ctx, p->haldata, p))) {
-		p->modbus_ok = 0;
-                if ((retval == EBADF || retval == ECONNRESET || retval == EPIPE)) {
-		    connection_state = RECOVER;
-		}
-	    } else {
-		p->modbus_ok++;
-	    }
-	    if (p->modbus_ok > MODBUS_MIN_OK) {
-		*(p->haldata->modbus_ok) = 1;
-	    } else {
-		*(p->haldata->modbus_ok) = 0;
-	    }
-	    /* don't want to scan too fast, and shouldn't delay more than a few seconds */
-	    if (p->haldata->looptime < 0.001) p->haldata->looptime = 0.001;
-	    if (p->haldata->looptime > 2.0) p->haldata->looptime = 2.0;
-	    loop_timespec.tv_sec = (time_t)(p->haldata->looptime);
-	    loop_timespec.tv_nsec = (long)((p->haldata->looptime - loop_timespec.tv_sec) * 1000000000l);
-	    if (!p->haldata->max_speed)
-		nanosleep(&loop_timespec, &remaining);
-	}
-    
-	switch (connection_state) {
-	case DONE:
-	    // cleanup actions before exiting.
-	    modbus_flush(p->ctx);
-	    // clear the command register (control and frequency override) so panel operation gets reactivated
-            /*
-            if ((retval = modbus_write_register(p->ctx, REG_COMMAND1, 0)) != 1) {
-		// not much we can do about it here if it goes wrong, so complain
-		fprintf(stderr, "%s: failed to release VFD from bus control (write to register 0x%x): %s\n", 
-			p->progname, REG_COMMAND1, modbus_strerror(errno));
-	    } else {
-		DBG("%s: VFD released from bus control.\n", p->progname);
-	    }
-            */
-	    break;
+                if (p->haldata->looptime < 0.001) p->haldata->looptime = 0.001;
+                if (p->haldata->looptime > 2.0)   p->haldata->looptime = 2.0;
+                loop_timespec.tv_sec  = (time_t)(p->haldata->looptime);
+                loop_timespec.tv_nsec = (long)((p->haldata->looptime -
+                                         loop_timespec.tv_sec) * 1000000000l);
+                nanosleep(&loop_timespec, &remaining);
+                continue;
+            }
 
-	case RECOVER:
-	    DBG("recover\n");
-	    set_defaults(p);
-	    p->read_initial_done = 0;
-            
-	    // reestablish connection to slave
+            /* Transition: disabled → enabled */
+            if (!p->was_enabled) {
+                DBG("%s: enabled->true: resuming Modbus\n", p->progname);
+                p->was_enabled = 1;
+                p->read_initial_done = 0;
+            }
+
+            /* Read VFD status */
+            if ((retval = read_data(p->ctx, p->haldata, p)))
+                p->modbus_ok = 0;
+            else
+                p->modbus_ok++;
+
+            *(p->haldata->modbus_ok) = (p->modbus_ok > MODBUS_MIN_OK) ? 1 : 0;
+
+            /* Write speed/control to VFD */
+            if ((retval = write_data(p->ctx, p->haldata, p))) {
+                p->modbus_ok = 0;
+                if (retval == EBADF || retval == ECONNRESET ||
+                    retval == EPIPE) {
+                    connection_state = RECOVER;
+                }
+            } else {
+                p->modbus_ok++;
+            }
+
+            *(p->haldata->modbus_ok) = (p->modbus_ok > MODBUS_MIN_OK) ? 1 : 0;
+
+            /* Rate-limit the poll loop */
+            if (p->haldata->looptime < 0.001) p->haldata->looptime = 0.001;
+            if (p->haldata->looptime > 2.0)   p->haldata->looptime = 2.0;
+            loop_timespec.tv_sec  = (time_t)(p->haldata->looptime);
+            loop_timespec.tv_nsec = (long)((p->haldata->looptime -
+                                     loop_timespec.tv_sec) * 1000000000l);
+            if (!p->haldata->max_speed)
+                nanosleep(&loop_timespec, &remaining);
+        }
+
+        /* Connection state machine */
+        switch (connection_state) {
+        case DONE:
+            modbus_flush(p->ctx);
+            break;
+
+        case RECOVER:
+            DBG("%s: recovering connection\n", p->progname);
+            set_defaults(p);
+            p->read_initial_done = 0;
             modbus_flush(p->ctx);
             modbus_close(p->ctx);
-            while ((connection_state != CONNECTED) &&  
-                   (connection_state != DONE)) {
+            while (connection_state != CONNECTED &&
+                   connection_state != DONE) {
                 sleep(p->reconnect_delay);
                 if (!modbus_connect(p->ctx)) {
                     connection_state = CONNECTED;
-                    DBG("rtu/tcpclient reconnect\n");
+                    DBG("%s: reconnected\n", p->progname);
                 } else {
-                    fprintf(stderr, "%s: recovery: modbus_connect(): %s\n", 
+                    fprintf(stderr, "%s: recovery: modbus_connect(): %s\n",
                             p->progname, modbus_strerror(errno));
                 }
             }
-	    break;
-	default: ;
-	}
-    }
-    retval = 0;	
+            break;
 
- finish:
+        default:
+            break;
+        }
+    }
+    retval = 0;
+
+finish:
     windup(p);
     return retval;
 }
-
