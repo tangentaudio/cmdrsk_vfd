@@ -120,6 +120,7 @@ typedef struct params {
     FILE        *fp;
     char        *inifile;
     int         reconnect_delay;
+    int         startup_delay;          /* seconds to wait after enable */
     modbus_t    *ctx;
     haldata_t   *haldata;
     int         hal_comp_id;
@@ -154,6 +155,7 @@ static params_type param = {
     .fp                 = NULL,
     .inifile            = NULL,
     .reconnect_delay    = 1,
+    .startup_delay      = 3,
     .ctx                = NULL,
     .haldata            = NULL,
     .hal_comp_id        = -1,
@@ -293,6 +295,7 @@ static int read_ini(param_pointer p)
     iniFindInt(p->fp, "TARGET", p->section, &p->slave);
     iniFindInt(p->fp, "POLLCYCLES", p->section, &p->pollcycles);
     iniFindInt(p->fp, "RECONNECT_DELAY", p->section, &p->reconnect_delay);
+    iniFindInt(p->fp, "STARTUP_DELAY", p->section, &p->startup_delay);
 
     if ((s = iniFind(p->fp, "DEVICE", p->section)))
         p->device = strdup(s);
@@ -864,6 +867,11 @@ int main(int argc, char **argv)
             /* Transition: disabled → enabled */
             if (!p->was_enabled) {
                 DBG("%s: enabled->true: resuming Modbus\n", p->progname);
+                if (p->startup_delay > 0) {
+                    DBG("%s: waiting %ds for VFD boot\n",
+                        p->progname, p->startup_delay);
+                    sleep(p->startup_delay);
+                }
                 p->was_enabled = 1;
                 p->read_initial_done = 0;
             }
